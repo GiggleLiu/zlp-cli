@@ -20,22 +20,15 @@ version-controllable files on disk.
 - Coupling to a session / chamber lifecycle (the way `cryo-zulip` is). Sync
   here is generic per-(workspace, stream, topic).
 
-## Prior art
+## Real-time sync mechanism
 
-`~/rcode/cryochamber` ships a Rust binary `cryo-zulip` that does
-incremental sync of one stream into a directory of per-message markdown
-files using a `zulip-sync.json` anchor. We adopt its **state-file +
-per-message markdown + PID-daemon** patterns; we do *not* adopt its
-single-stream-per-directory or chamber-session coupling, because this
-project is multi-workspace and multi-stream by design.
-
-**One important upgrade over `cryo-zulip`'s polling loop:** the official
-`zulip` Python client provides `Client.call_on_each_event(callback,
-narrow=…, event_types=…)`, which uses Zulip's real-time **event queue**
-(long-polling). The server pushes events the moment they happen, with
-auto-reconnect and `BAD_EVENT_QUEUE_ID` recovery built in. We use this
-for the live tail, not periodic polling — sub-second latency, lower
-server load, and we transparently get edit/delete/reaction events too.
+The official `zulip` Python client provides
+`Client.call_on_each_event(callback, narrow=…, event_types=…)`, which
+uses Zulip's real-time **event queue** (long-polling). The server pushes
+events the moment they happen, with auto-reconnect and
+`BAD_EVENT_QUEUE_ID` recovery built in. We use this for the live tail
+rather than periodic polling — sub-second latency, lower server load,
+and we transparently get edit / delete / reaction events too.
 
 ## Stack
 
@@ -85,8 +78,7 @@ zulip/
 ├── mail/                      # local message archive (gitignored)
 │   └── <workspace>/<stream>/<topic|_all>/
 │       ├── .sync-state.json   # anchor + stream metadata for this sync target
-│       ├── <YYYY-MM-DDTHH-MM-SS>_<sender>_id<msgid>.md      # human-readable
-│       ├── <YYYY-MM-DDTHH-MM-SS>_<sender>_id<msgid>.json    # full raw API object
+│       ├── <YYYY-MM-DDTHH-MM-SS>_<sender>_id<msgid>.md      # full message: raw API in YAML frontmatter, markdown body
 │       └── _files/<sha1>__<original-name>                   # downloaded attachments
 └── run/                       # daemon PID + log files (gitignored)
     └── <workspace>__<stream>__<topic>.{pid,log}
@@ -144,7 +136,7 @@ Conventions for Make variables: `STREAM`, `TOPIC`, `USER`, `MSG`, `FILE`,
 ### Local archive + sync
 | Target | Required vars | Optional vars | Purpose |
 |--------|---------------|---------------|---------|
-| `make pull` | `STREAM` | `TOPIC`, `WORKSPACE`, `IMPORT_HISTORY=0`, `ATTACHMENTS=1` | One-shot catchup via `get_messages` (with `apply_markdown=False`) from `last_message_id` into `mail/<ws>/<stream>/<topic\|_all>/`. Writes `.md` + `.json` per message; downloads attachments unless `ATTACHMENTS=0`. Updates `.sync-state.json`. With `IMPORT_HISTORY=1` on first run, fetches all available history; otherwise starts from the newest message. |
+| `make pull` | `STREAM` | `TOPIC`, `WORKSPACE`, `IMPORT_HISTORY=0`, `ATTACHMENTS=1` | One-shot catchup via `get_messages` (with `apply_markdown=False`) from `last_message_id` into `mail/<ws>/<stream>/<topic\|_all>/`. Writes one self-contained `.md` per message (full raw API object in frontmatter, markdown body); downloads attachments unless `ATTACHMENTS=0`. Updates `.sync-state.json`. With `IMPORT_HISTORY=1` on first run, fetches all available history; otherwise starts from the newest message. |
 | `make sync` | `STREAM` | `TOPIC`, `WORKSPACE`, `ATTACHMENTS=1` | Start a background daemon: catchup once via `pull`, then `client.call_on_each_event(...)` for the live tail. Real-time, no polling interval. PID and log under `run/`. |
 | `make unsync` | `STREAM` | `TOPIC`, `WORKSPACE` | Stop the daemon for this sync target. |
 | `make sync-status` | — | `WORKSPACE` | List all sync targets, their last-pulled message id, and whether the daemon is alive. |
@@ -193,7 +185,7 @@ emitted unchanged so it can be piped to `jq`.
 - `streams`, `topics`, `workspaces` — one item per line, plain text.
 - `send`, `dm`, `edit`, `delete`, `upload` — print `ok id=<message_id>` on success.
 
-## Sync mechanics (ported from `cryo-zulip`)
+## Sync mechanics
 
 ### State file (`mail/<ws>/<stream>/<topic|_all>/.sync-state.json`)
 
@@ -218,70 +210,82 @@ emitted unchanged so it can be piped to `jq`.
   no archive (skip backfill). With `IMPORT_HISTORY=1`: set anchor to 0 and
   fetch all available history.
 
-### Per-message storage — side-by-side files for completeness
+### Per-message storage — single self-contained file
 
-For each message, the daemon writes **two files** under
-`mail/<ws>/<stream>/<topic|_all>/`:
+For each message, the daemon writes one file:
 
-1. `<UTC>_<sender>_id<msgid>.md` — human-readable markdown for grep / browse.
-2. `<UTC>_<sender>_id<msgid>.json` — the full raw API message object,
-   exactly as returned by the server (reactions, edit_history, flags,
-   mentions, topic_links, sender metadata — every field).
+```
+mail/<ws>/<stream>/<topic|_all>/<UTC>_<sender>_id<msgid>.md
+```
 
-The `id<msgid>` suffix makes dedup trivial (re-pull is idempotent — skip
-if `.json` already exists). The `.md` file is *derived* from the `.json`
-and may be regenerated from it.
+Filename example: `2026-04-26T10-30-00_alice_id147641.md`. The
+`id<msgid>` suffix makes dedup trivial — re-fetching is idempotent
+(skip if the file already exists, unless rewriting due to an edit).
 
-**Why both:** the `.md` is what you read; the `.json` is what guarantees
-you can fully reconstruct or re-export the message later — including
-metadata that doesn't fit cleanly into frontmatter (e.g. reactions,
-multi-edit history).
-
-#### `.md` file — body and frontmatter
-
-API messages are fetched with `apply_markdown=False` so `content` is the
-original Zulip markdown source, not rendered HTML.
+The file is one Markdown document with **YAML frontmatter holding the
+full raw API message object** (every field returned by the server —
+`reactions`, `edit_history`, `flags`, `mentions`, `topic_links`,
+sender metadata, etc.) and the **markdown body below**. The body comes
+from the `content` field, fetched with `apply_markdown=False` so it's
+the original markdown source, not rendered HTML. To avoid duplication,
+`content` is omitted from the frontmatter — the body *is* the content.
 
 ```
 ---
-from: Alice Chen
-from_email: alice@example.com
+# Full raw API message object (minus `content`, which is the body):
+id: 147641
 sender_id: 9821
-stream: general
-topic: hello
-timestamp: 2026-04-26T10:30:00Z
-zulip_message_id: 147641
+sender_full_name: Alice Chen
+sender_email: alice@example.com
 type: stream
-edited: false                  # true if last_edit_timestamp present
-deleted: false                 # set true and renamed to .deleted on delete
-reactions: 0                   # count; details in .json
-attachments: []                # list of relative paths under _files/
-source: zulip
+display_recipient: general
+subject: hello                     # Zulip's term for topic
+timestamp: 1745663400              # unix seconds (server's native)
+timestamp_iso: 2026-04-26T10:30:00Z  # added for readability
+last_edit_timestamp: null
+edit_history: null
+reactions: []
+flags: [read]
+mentions: []
+topic_links: []
+client: website
+recipient_id: 4012
+avatar_url: https://...
+# --- archive-only metadata (prefixed `_`) ---
+_workspace: quantum-info
+_attachments: []                   # relative paths under _files/, populated if downloaded
+_deleted: false
 ---
 
 hello world, here's a thought…
 ```
 
-This frontmatter is a superset of `cryo-zulip`'s — anything that already
-parses cryo files will parse these too. The richer fields (`sender_id`,
-`reactions`, `attachments`, `edited`) are extras; the canonical truth
-remains in the sibling `.json`.
+**Round-trip guarantee:** `parse_frontmatter(file)` + `body` reconstructs
+the original API message object verbatim (re-attach `content = body`,
+strip `_`-prefixed archive metadata).
 
-On `update_message`: rewrite both `.md` and `.json` (the `.json`'s
-`edit_history` already accumulates the chain server-side). On
-`delete_message`: rename both files to `*.deleted`.
+**Edits** (`update_message` event): rewrite the same file in place. The
+`edit_history` field accumulates the chain server-side, so previous
+versions remain visible in the frontmatter.
+
+**Deletes** (`delete_message` event): rename file to
+`<...>.md.deleted` and set `_deleted: true` in frontmatter. Never
+hard-delete — paper trail is the point of an archive.
 
 #### Attachments
 
 When a message body contains `/user_uploads/...` URLs, the daemon
-downloads each one to
-`mail/<ws>/<stream>/<topic|_all>/_files/<sha1>__<original-filename>`
-and rewrites the URL in the `.md` body to the relative `_files/...`
-path. The `.json` keeps the original URL untouched. SHA-1 prefix
-deduplicates files referenced from multiple messages.
+downloads each to
+`mail/<ws>/<stream>/<topic|_all>/_files/<sha1>__<original-filename>`,
+rewrites the URLs in the **body** to the relative `_files/...` path,
+and lists the relative paths under `_attachments` in the frontmatter.
+The original URLs remain in the API object's natural fields
+(`topic_links` etc.) and are also recoverable from the `edit_history`
+when present. SHA-1 prefix deduplicates files referenced from multiple
+messages.
 
-Skip attachment download if `--no-attachments` is passed (or
-`ATTACHMENTS=0` from Make).
+Skip attachment download with `ATTACHMENTS=0` (e.g.
+`make sync STREAM=general ATTACHMENTS=0`).
 
 ### Daemon (`scripts/sync_daemon.py`)
 
@@ -298,13 +302,15 @@ Skip attachment download if `--no-attachments` is passed (or
      This blocks. The SDK long-polls `/events`, auto-reconnects on
      network blips, and re-registers the queue on `BAD_EVENT_QUEUE_ID`.
 - `handle_event(event)` per event type:
-  - `message` → `format.write_archive_file(...)`, then update
-    `last_message_id` in `.sync-state.json`.
-  - `update_message` → look up `id<msgid>.md` in the archive, rewrite
-    body and add an `edited_at` line to frontmatter (or skip if file is
-    not present locally — e.g. message predates archive).
+  - `message` → `format.write_archive_file(message)` (writes a single
+    self-contained `.md`), then update `last_message_id` in
+    `.sync-state.json`.
+  - `update_message` → re-fetch the full message via `get_messages` and
+    rewrite the same `id<msgid>.md` (the API's `edit_history` accumulates
+    server-side, so previous versions stay in the file).
   - `delete_message` → rename `id<msgid>.md` to
-    `id<msgid>.md.deleted` (don't hard-delete; leaves a paper trail).
+    `id<msgid>.md.deleted` and set `_deleted: true` in frontmatter
+    (paper trail; no hard delete).
 - Liveness check (used by `make sync-status` and `make unsync`): read PID,
   `os.kill(pid, 0)` — alive if no exception or `EPERM`.
 - `make unsync` sends SIGTERM and removes the pid file once the process
