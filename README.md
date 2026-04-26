@@ -56,13 +56,13 @@ zlp sync
 
 # ...or in the background as a daemon
 zlp sync --daemon
-tail -f run/_workspace.log                 # daemon log with archived file paths
+tail -f .run/_workspace.log                 # daemon log with archived file paths
 
 # or narrow sync to one stream
 zlp pull --stream general --import-history
 zlp pull --stream general                  # one incremental stream pass
 zlp sync --daemon --stream general         # background stream daemon
-tail -f run/general__*.log                 # stream daemon log
+tail -f .run/general__*.log                 # stream daemon log
 ```
 
 For multi-line message bodies pipe stdin: `zlp send ... --msg-file -`.
@@ -74,8 +74,8 @@ Three settings, with this precedence: **flag > env > default**.
 | Setting | Flag | Env var | Default |
 | --- | --- | --- | --- |
 | zuliprc path | `--config` | `ZULIP_CONFIG_FILE` | `./zuliprc` |
-| archive root | `--archive-root` | `ZLP_ARCHIVE_ROOT` | `./mail` |
-| daemon pid/log root | `--run-root` | `ZLP_RUN_ROOT` | `./run` |
+| archive root | `--archive-root` | `ZLP_ARCHIVE_ROOT` | `.` |
+| daemon pid/log root | `--run-root` | `ZLP_RUN_ROOT` | `./.run` |
 
 Defaults are CWD-relative. An outer "workspace manager" can `cd` into a
 per-workspace directory or set the env vars to point at workspace-specific
@@ -108,16 +108,17 @@ A `Makefile` is included for convenience (`make whoami`, `make send STREAM=...`,
 Under `--archive-root`:
 
 ```
-mail/
+<archive-root>/
+├── .sync-state.json                                     # workspace cursor
 └── <stream-slug>/
     └── <topic-slug | _all>/
         ├── 2026-04-26T02-30-00_alice-chen_id147641.md   # one file per message
         ├── _files/<sha-prefix>__attachment.pdf          # downloaded attachments
-        └── .sync-state.json                             # incremental cursor
+        └── .sync-state.json                             # per-stream/topic cursor
 ```
 
-Workspace `zlp pull` and `zlp sync --daemon` write a workspace-level
-`.sync-state.json` directly under `mail/`; individual messages still land under
+Workspace-wide `zlp pull` and `zlp sync --daemon` write a workspace-level
+`.sync-state.json` at the archive root; individual messages still land under
 their normal stream/topic directories. By default they follow the account's
 subscribed stream message feed, including subscribed private streams, and
 ignore direct messages. `--all-public` is an advanced mode for public channels
@@ -134,22 +135,22 @@ archived	<stream-slug>/<topic-slug>/<message-file>.md
 deleted	<stream-slug>/<topic-slug>/<message-file>.md.deleted
 ```
 
-For background daemons, these lines are written to `run/*.log` (workspace daemon
-to `run/_workspace.log`, stream daemons to `run/<stream-slug>__<topic-slug>.log`).
+For background daemons, these lines are written to `.run/*.log` (workspace daemon
+to `.run/_workspace.log`, stream daemons to `.run/<stream-slug>__<topic-slug>.log`).
 Tail those files directly. Pass `--silent` to suppress them.
 
 For agents, `zlp pull` is the normal "what changed since the last pull?" command:
 each `archived\t...` line is a file to read for that pass, followed by
 `ok archived=N`. The cursor is the archive's `.sync-state.json`; it tracks last
 pulled, not a separate per-agent read receipt. Use `zlp sync --daemon` only when
-you want continuous background mirroring; tail `run/_workspace.log` to inspect
+you want continuous background mirroring; tail `.run/_workspace.log` to inspect
 that daemon's output.
 
 ## For agent integrations
 
 The CLI is designed to be the primitive layer below richer integrations:
 
-- **Outer workspace manager.** Keep `zuliprc` files, mail dirs, and run dirs
+- **Outer workspace manager.** Keep `zuliprc` files, archive roots, and run dirs
   outside this package and dispatch `zlp` per account by setting
   `ZULIP_CONFIG_FILE`, `ZLP_ARCHIVE_ROOT`, `ZLP_RUN_ROOT`.
 - **MCP / function-calling shells.** Subcommands map cleanly onto tool

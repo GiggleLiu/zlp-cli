@@ -26,13 +26,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--archive-root",
-        default=os.environ.get("ZLP_ARCHIVE_ROOT", "mail"),
-        help="archive output root (default: $ZLP_ARCHIVE_ROOT or ./mail)",
+        default=os.environ.get("ZLP_ARCHIVE_ROOT", "."),
+        help="archive output root (default: $ZLP_ARCHIVE_ROOT or .)",
     )
     parser.add_argument(
         "--run-root",
-        default=os.environ.get("ZLP_RUN_ROOT", "run"),
-        help="daemon pid/log root (default: $ZLP_RUN_ROOT or ./run)",
+        default=os.environ.get("ZLP_RUN_ROOT", ".run"),
+        help="daemon pid/log root (default: $ZLP_RUN_ROOT or ./.run)",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
