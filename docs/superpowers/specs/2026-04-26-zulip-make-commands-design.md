@@ -22,13 +22,22 @@ version-controllable files on disk.
 
 ## Real-time sync mechanism
 
-The official `zulip` Python client provides
-`Client.call_on_each_event(callback, narrow=…, event_types=…)`, which
-uses Zulip's real-time **event queue** (long-polling). The server pushes
-events the moment they happen, with auto-reconnect and
-`BAD_EVENT_QUEUE_ID` recovery built in. We use this for the live tail
-rather than periodic polling — sub-second latency, lower server load,
-and we transparently get edit / delete / reaction events too.
+The official `zulip` Python client supports Zulip's **event queue**
+(long-poll) via `register` + `get_events`. We use the lower-level
+`register` / `get_events` pair (not the convenience
+`call_on_each_event`) so we can interleave catchup and live tail
+without a race window.
+
+Strategy ("register-then-catchup-then-drain"):
+1. **Register the queue first.** `client.register(narrow=…, event_types=["message", "update_message", "delete_message"])` returns a `queue_id` and the server starts buffering events from that moment.
+2. **REST catchup.** `get_messages(anchor=last_message_id, include_anchor=False, num_after=…, apply_markdown=False)` walks forward in batches until `found_newest=True`. Any new message that arrives during this step is also captured by step 3 because the queue is already open.
+3. **Live tail.** Loop over `get_events(queue_id, last_event_id)`. On each event, write/update the archive and advance `last_message_id` and `last_event_id` atomically.
+
+This eliminates the race window between catchup and tail and gives us
+sub-second latency once the live tail starts. We handle
+`BAD_EVENT_QUEUE_ID` (server restart or queue expiry) by re-registering
+the queue and re-running the catchup; see *Reconciliation* below for
+recovering missed edits/deletes on old messages.
 
 ## Stack
 
@@ -106,14 +115,20 @@ state file and its own daemon process.
 
 ## Make target reference
 
-Conventions for Make variables: `STREAM`, `TOPIC`, `USER`, `MSG`, `FILE`,
-`LIMIT`, `FORMAT`, `QUERY`, `ID`, `WORKSPACE`. Defaults are shown.
+Conventions for Make variables: `STREAM` (alias `CHANNEL` — Zulip's
+modern user-facing term; both resolve to the same arg), `TOPIC`, `TO`
+(DM recipient(s) — *not* `USER`, which collides with the shell's
+`$USER`), `MSG`, `MSG_FILE` (`-` reads from stdin), `FILE`, `LIMIT`,
+`FORMAT`, `QUERY`, `ID`, `WORKSPACE`. Defaults are shown. All
+message-fetching paths use `apply_markdown=False` so `content` is the
+original markdown source, not rendered HTML.
 
 ### Setup / meta
 | Target              | Purpose                                                |
 |---------------------|--------------------------------------------------------|
-| `make install`      | `uv sync` — create `.venv`, install `zulip` package.   |
+| `make install`      | `uv sync` — create `.venv`, install `zulip` + `pyyaml`. |
 | `make workspaces`   | List `configs/*.zuliprc` workspaces.                   |
+| `make whoami`       | Verify auth: print server URL, account email, and full name. |
 | `make help`         | List all targets with one-line descriptions.           |
 
 ### Read
@@ -127,9 +142,9 @@ Conventions for Make variables: `STREAM`, `TOPIC`, `USER`, `MSG`, `FILE`,
 ### Write
 | Target | Required vars | Optional vars | Purpose |
 |--------|---------------|---------------|---------|
-| `make send` | `STREAM`, `TOPIC`, `MSG` | `WORKSPACE` | Send `MSG` to `STREAM > TOPIC`. |
-| `make dm` | `USER`, `MSG` | `WORKSPACE` | Send a DM. `USER` may be comma-separated for group DM. |
-| `make edit` | `ID`, `MSG` | `WORKSPACE` | Edit your own message by id. |
+| `make send` | `STREAM`, `TOPIC`, (`MSG` or `MSG_FILE`) | `WORKSPACE` | Send to `STREAM > TOPIC`. `MSG_FILE=-` reads body from stdin (use this for multi-line / quoted bodies). |
+| `make dm` | `TO`, (`MSG` or `MSG_FILE`) | `WORKSPACE` | Send a DM. `TO` may be comma-separated for group DM. |
+| `make edit` | `ID`, (`MSG` or `MSG_FILE`) | `WORKSPACE` | Edit your own message by id. |
 | `make delete` | `ID` | `WORKSPACE` | Delete your own message by id. |
 | `make upload` | `FILE`, `STREAM`, `TOPIC` | `MSG`, `WORKSPACE` | Upload a file and post a message containing the resulting link. |
 
@@ -137,10 +152,14 @@ Conventions for Make variables: `STREAM`, `TOPIC`, `USER`, `MSG`, `FILE`,
 | Target | Required vars | Optional vars | Purpose |
 |--------|---------------|---------------|---------|
 | `make pull` | `STREAM` | `TOPIC`, `WORKSPACE`, `IMPORT_HISTORY=0`, `ATTACHMENTS=1` | One-shot catchup via `get_messages` (with `apply_markdown=False`) from `last_message_id` into `mail/<ws>/<stream>/<topic\|_all>/`. Writes one self-contained `.md` per message (full raw API object in frontmatter, markdown body); downloads attachments unless `ATTACHMENTS=0`. Updates `.sync-state.json`. With `IMPORT_HISTORY=1` on first run, fetches all available history; otherwise starts from the newest message. |
-| `make sync` | `STREAM` | `TOPIC`, `WORKSPACE`, `ATTACHMENTS=1` | Start a background daemon: catchup once via `pull`, then `client.call_on_each_event(...)` for the live tail. Real-time, no polling interval. PID and log under `run/`. |
-| `make unsync` | `STREAM` | `TOPIC`, `WORKSPACE` | Stop the daemon for this sync target. |
+| `make sync` | `STREAM` | `TOPIC`, `WORKSPACE`, `ATTACHMENTS=1` | Start a background daemon: register-then-catchup-then-drain (see *Real-time sync mechanism*). Real-time, no polling interval. PID and log under `run/`. |
+| `make sync-fg` | `STREAM` | `TOPIC`, `WORKSPACE`, `ATTACHMENTS=1` | Same as `sync` but stays in the foreground for debugging (logs to stderr; SIGINT to stop). |
+| `make unsync` | `STREAM` | `TOPIC`, `WORKSPACE` | Stop the daemon for this sync target. Cleans up stale PID files automatically. |
 | `make sync-status` | — | `WORKSPACE` | List all sync targets, their last-pulled message id, and whether the daemon is alive. |
+| `make sync-log` | `STREAM` | `TOPIC`, `WORKSPACE`, `LINES=50` | Tail the daemon log for this sync target. |
+| `make refresh` | `STREAM` | `TOPIC`, `WORKSPACE`, `SINCE=24h` | Reconciliation: re-fetch all known messages newer than `SINCE` and rewrite their `.md`. Recovers edits / deletes / reactions that were missed (e.g. while the daemon was down past queue-expiry). |
 | `make inbox` | `STREAM` | `TOPIC`, `LIMIT=20`, `WORKSPACE` | Render the most recent archived messages from disk (offline; works without network). |
+| `make grep` | `QUERY` | `STREAM`, `TOPIC`, `WORKSPACE` | Search the local archive (`ripgrep` over `mail/**/*.md`); offline. |
 
 ### Argument guards
 
@@ -203,8 +222,14 @@ emitted unchanged so it can be piped to `jq`.
 
 - `stream_id` and `self_email` are resolved on first `pull` and cached.
 - `last_message_id` is the anchor: the next pull uses
-  `narrow=[…]` + `anchor=last_message_id+1` + `num_before=0` +
-  `num_after=5000`, then walks forward in batches if `found_newest=false`.
+  `narrow=[…]` + `anchor=last_message_id` + `include_anchor=False` +
+  `num_before=0` + `num_after=5000`, then walks forward in batches
+  while `found_newest` is false. The anchor is advanced **only after**
+  each batch's archive writes succeed (atomic temp-file + `os.replace`),
+  so a crash mid-batch leaves the anchor pointing to the last fully
+  archived message — re-run is idempotent.
+- The daemon also persists `last_event_id` from `register` /
+  `get_events` so a reconnect resumes the event stream without gap.
 - On first run with `IMPORT_HISTORY=0` (default): set
   `last_message_id` to the server's current newest message id and store
   no archive (skip backfill). With `IMPORT_HISTORY=1`: set anchor to 0 and
@@ -215,12 +240,21 @@ emitted unchanged so it can be piped to `jq`.
 For each message, the daemon writes one file:
 
 ```
-mail/<ws>/<stream>/<topic|_all>/<UTC>_<sender>_id<msgid>.md
+mail/<ws-slug>/<stream-slug>/<topic-slug|_all>/<UTC>_<sender-slug>_id<msgid>.md
 ```
 
 Filename example: `2026-04-26T10-30-00_alice_id147641.md`. The
 `id<msgid>` suffix makes dedup trivial — re-fetching is idempotent
 (skip if the file already exists, unless rewriting due to an edit).
+
+**Path slugging** (applied to `<ws>`, `<stream>`, `<topic>`, `<sender>`):
+NFKC-normalize, lowercase, replace any character not in `[a-z0-9._-]`
+with `-`, collapse runs of `-`, strip leading/trailing `-`, truncate to
+80 chars. If the slug is empty, would equal the reserved literal `_all`,
+or collides with an existing slug at that path level, append
+`-<8-char-blake2b-hash-of-original>`. The unsanitized originals are
+preserved in frontmatter (`subject`, `display_recipient`,
+`sender_full_name`).
 
 The file is one Markdown document with **YAML frontmatter holding the
 full raw API message object** (every field returned by the server —
@@ -229,6 +263,15 @@ sender metadata, etc.) and the **markdown body below**. The body comes
 from the `content` field, fetched with `apply_markdown=False` so it's
 the original markdown source, not rendered HTML. To avoid duplication,
 `content` is omitted from the frontmatter — the body *is* the content.
+
+YAML serialization uses `yaml.safe_dump(..., sort_keys=True,
+allow_unicode=True, default_flow_style=False)`. Parsing uses
+`yaml.safe_load`. Files are written via `tempfile.NamedTemporaryFile`
+in the same directory + `os.replace`, so partially-written files never
+appear on disk.
+
+Archive-only metadata is namespaced under a single `_archive` key (so
+it never collides with future API field additions):
 
 ```
 ---
@@ -241,7 +284,6 @@ type: stream
 display_recipient: general
 subject: hello                     # Zulip's term for topic
 timestamp: 1745663400              # unix seconds (server's native)
-timestamp_iso: 2026-04-26T10:30:00Z  # added for readability
 last_edit_timestamp: null
 edit_history: null
 reactions: []
@@ -251,87 +293,89 @@ topic_links: []
 client: website
 recipient_id: 4012
 avatar_url: https://...
-# --- archive-only metadata (prefixed `_`) ---
-_workspace: quantum-info
-_attachments: []                   # relative paths under _files/, populated if downloaded
-_deleted: false
+_archive:
+  workspace: quantum-info
+  fetched_at: 2026-04-26T10:30:01Z
+  permalink: https://quantum-info.zulipchat.com/#narrow/channel/13-general/topic/hello/near/147641
+  attachments: []                  # relative paths under _files/ (URLs in body remain unchanged)
+  deleted: false
 ---
 
 hello world, here's a thought…
 ```
 
 **Round-trip guarantee:** `parse_frontmatter(file)` + `body` reconstructs
-the original API message object verbatim (re-attach `content = body`,
-strip `_`-prefixed archive metadata).
+the original API message object verbatim — re-attach `content = body`,
+strip the `_archive` key. The body itself is **never rewritten** (URLs
+to `/user_uploads/...` stay verbatim), so round-trip equality holds
+even when attachments are downloaded — the local file paths only appear
+in `_archive.attachments`. A separate helper `make render ID=<msgid>`
+can produce a body with attachment URLs substituted on demand.
 
-**Edits** (`update_message` event): rewrite the same file in place. The
-`edit_history` field accumulates the chain server-side, so previous
-versions remain visible in the frontmatter.
+**Edits** (`update_message` event): the event may carry one or many
+`message_id`s and may also indicate a **topic / channel move** (look
+for `subject`/`stream_id` keys in the event). For each affected id:
+re-fetch the message via `get_messages`, write the new state, and
+**move the file to the new path** if the topic / channel changed (old
+path → new slug path). The API's `edit_history` already accumulates the
+chain server-side, so previous versions stay in the frontmatter.
 
-**Deletes** (`delete_message` event): rename file to
-`<...>.md.deleted` and set `_deleted: true` in frontmatter. Never
-hard-delete — paper trail is the point of an archive.
+**Deletes** (`delete_message` event): the event may carry one or many
+`message_id`s. For each id, rename the file to `<...>.md.deleted` and
+set `_archive.deleted: true`. Never hard-delete — paper trail is the
+point of an archive.
+
+**Reactions are not pushed live.** Reaction state is captured at fetch
+time in the `reactions` field; to refresh reaction counts on older
+messages, use `make refresh`.
 
 #### Attachments
 
 When a message body contains `/user_uploads/...` URLs, the daemon
 downloads each to
-`mail/<ws>/<stream>/<topic|_all>/_files/<sha1>__<original-filename>`,
-rewrites the URLs in the **body** to the relative `_files/...` path,
-and lists the relative paths under `_attachments` in the frontmatter.
-The original URLs remain in the API object's natural fields
-(`topic_links` etc.) and are also recoverable from the `edit_history`
-when present. SHA-1 prefix deduplicates files referenced from multiple
-messages.
+`mail/<ws-slug>/<stream-slug>/<topic-slug|_all>/_files/<sha256-12>__<sanitized-original-filename>`
+(SHA-256 truncated to 12 hex chars; sanitized filename strips path
+separators and control chars, truncates to 80 chars). The body is
+**not** rewritten — the original URLs stay verbatim, preserving
+round-trip equality. The local paths are listed under
+`_archive.attachments` so a renderer can substitute on demand.
 
 Skip attachment download with `ATTACHMENTS=0` (e.g.
 `make sync STREAM=general ATTACHMENTS=0`).
 
+Out of v1 scope:
+- DM archive / sync (the `_all` and per-topic structure assumes
+  channels). DMs can still be fetched ad-hoc with `make dm` (write) and
+  `make messages NARROW=is:dm` (future).
+
 ### Daemon (`scripts/sync_daemon.py`)
 
-- Spawned via `make sync …`; detached via `os.fork()` (POSIX-only — fine
-  on macOS/Linux). Writes its PID to `run/<ws>__<stream>__<topic>.pid`.
-- Lifecycle:
-  1. **Catchup:** call the same code path as `make pull` to drain any
-     messages added while the daemon was down (using `get_messages`
-     anchored at `last_message_id`). This closes the gap between
-     `last_message_id` and the server's current tail.
-  2. **Live tail:** call
-     `client.call_on_each_event(handle_event, narrow=narrow_for_target(),
-     event_types=["message", "update_message", "delete_message"])`.
-     This blocks. The SDK long-polls `/events`, auto-reconnects on
-     network blips, and re-registers the queue on `BAD_EVENT_QUEUE_ID`.
+- Spawned via `make sync …`; detached via double-`os.fork()` +
+  `os.setsid()` (POSIX-only — fine on macOS/Linux). Writes its PID to
+  `run/<ws-slug>__<stream-slug>__<topic-slug>.pid`. `make sync-fg`
+  skips the fork and runs in the foreground for debugging.
+- Lifecycle (register-then-catchup-then-drain):
+  1. `client.register(narrow=…, event_types=["message", "update_message", "delete_message"])` → save `queue_id`, `last_event_id`. Server now buffers events.
+  2. **Catchup:** call the same code path as `make pull` (`get_messages` from `last_message_id` forward). Any new messages that arrive during this step are also captured by step 3, so no race.
+  3. **Drain loop:** `while True: events = client.get_events(queue_id, last_event_id); for event in events: handle_event(event); last_event_id = event["id"]`. Persist `last_event_id` after each batch.
 - `handle_event(event)` per event type:
-  - `message` → `format.write_archive_file(message)` (writes a single
-    self-contained `.md`), then update `last_message_id` in
-    `.sync-state.json`.
-  - `update_message` → re-fetch the full message via `get_messages` and
-    rewrite the same `id<msgid>.md` (the API's `edit_history` accumulates
-    server-side, so previous versions stay in the file).
-  - `delete_message` → rename `id<msgid>.md` to
-    `id<msgid>.md.deleted` and set `_deleted: true` in frontmatter
-    (paper trail; no hard delete).
-- Liveness check (used by `make sync-status` and `make unsync`): read PID,
-  `os.kill(pid, 0)` — alive if no exception or `EPERM`.
-- `make unsync` sends SIGTERM and removes the pid file once the process
-  exits (5-second wait with poll, then SIGKILL fallback). The SDK loop
-  is interruptible because long-poll requests have a `~10 min` timeout.
-- One sync target = one daemon. Re-running `make sync` for an already-running
-  target is a no-op with a friendly message.
+  - `message` → write `.md` and update `last_message_id` (atomic).
+  - `update_message` → for each id in `message_id` / `message_ids`: re-fetch via `get_messages`, write to the (possibly new, on topic/channel move) path, remove the old file if the path changed.
+  - `delete_message` → for each id in `message_id` / `message_ids`: rename to `*.md.deleted`, set `_archive.deleted: true`.
+  - Other events: ignored.
+- On `BAD_EVENT_QUEUE_ID` (server restart / queue expiry past the ~10 min idle window): re-register, re-run catchup, continue drain. Edits / deletes / reactions on already-archived messages that happened during the gap are *not* recovered automatically — run `make refresh` to reconcile.
+- Liveness check (used by `make sync-status` and `make unsync`): read PID, `os.kill(pid, 0)` — alive if no exception or `EPERM`. If the PID file exists but the process is dead, `sync-status` flags it as **stale** and `unsync` removes it.
+- `make unsync` sends SIGTERM and removes the pid file once the process exits (5-second wait with poll, then SIGKILL fallback). `get_events` returns within ~10 min so SIGTERM is honored promptly between long-polls.
+- One sync target = one daemon. Re-running `make sync` for an already-running target is a no-op with a friendly message.
 
-### Why event queue, not polling
+### Reconciliation (`make refresh`)
 
-`call_on_each_event` is Zulip's native real-time mechanism. Versus a
-polling loop:
-
-| Aspect           | Polling (`get_messages` every N s)        | `call_on_each_event` (event queue)     |
-|------------------|-------------------------------------------|----------------------------------------|
-| Latency          | up to N seconds                           | sub-second (server-pushed)             |
-| Server load      | repeated paginated `/messages` calls      | one long-poll connection per target    |
-| Edits & deletes  | not detected without extra polling logic  | first-class events                     |
-| Reconnect        | hand-rolled                               | built into the SDK                     |
-| Server restart   | hand-rolled queue-id recovery             | built-in `BAD_EVENT_QUEUE_ID` retry    |
-| Code we maintain | the loop, retry, and dedup                | just the per-event callback            |
+The event queue closes a known gap: events on already-archived messages
+(reactions, edits, deletes) that occur while the daemon is down past
+the ~10 min queue-expiry are lost. `make refresh STREAM=…
+[TOPIC=…] [SINCE=24h]` re-fetches every message in the archive whose
+`timestamp` is within `SINCE` and rewrites the `.md` from the fresh
+API object. Run it on a schedule (e.g., daily cron) for full fidelity.
 
 ### `make sync-status` output
 
