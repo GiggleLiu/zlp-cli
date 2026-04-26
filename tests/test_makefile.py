@@ -49,6 +49,28 @@ class MakefileWorkflowTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("uv build", proc.stdout)
 
+    def test_pull_and_sync_targets_split_one_shot_and_daemon(self):
+        pull_proc = subprocess.run(
+            ["make", "-n", "pull"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(pull_proc.returncode, 0, pull_proc.stderr)
+        self.assertIn("zlp pull", pull_proc.stdout)
+        self.assertNotIn(" sync ", pull_proc.stdout)
+
+        sync_proc = subprocess.run(
+            ["make", "-n", "sync", "STREAM=general", "DAEMON=1", "SILENT=1"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(sync_proc.returncode, 0, sync_proc.stderr)
+        self.assertIn('zlp sync --stream "general"', sync_proc.stdout)
+        self.assertIn("--daemon", sync_proc.stdout)
+        self.assertIn("--silent", sync_proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

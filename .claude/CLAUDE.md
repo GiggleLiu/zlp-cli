@@ -24,13 +24,15 @@ Repo-local skills live under `.claude/skills/*/SKILL.md`.
 
 ## Commands
 
-Run `make help` for the full list. Common targets: `install`, `fmt`, `fmt-check`, `lint`, `test`, `check` (fmt-check + lint + test), `build`. Zulip-facing wrappers (`make whoami`, `make streams`, `make messages STREAM=...`, `make send STREAM=... TOPIC=... MSG=...`, `make inbox STREAM=...`) are convenience shims over the CLI.
+Run `make help` for the full list. Common targets: `install`, `fmt`, `fmt-check`, `lint`, `test`, `check` (fmt-check + lint + test), `build`. Zulip-facing wrappers (`make whoami`, `make streams`, `make messages STREAM=...`, `make send STREAM=... TOPIC=... MSG=...`, `make sync DAEMON=1`) are convenience shims over the CLI.
+
+Current CLI surface (15 commands): `whoami`, `streams`, `topics`, `messages`, `search`, `send`, `dm`, `edit`, `delete`, `upload`, `pull`, `sync` (foreground; `--daemon` for background), `unsync`, `sync-status`, `reconcile`. The README command table is the source of truth.
 
 ### Running a single test
 
 ```bash
 uv run python -m unittest tests.test_cli -v
-uv run python -m unittest tests.test_cli.TestSendCommand.test_sends_with_topic
+uv run python -m unittest tests.test_cli.HelpAndUsageTests.test_help_runs_cleanly_and_lists_subcommands
 ```
 
 ### Running the CLI from source
@@ -42,9 +44,9 @@ uv run zlp messages --stream general --limit 5
 
 ## Architecture
 
-- `src/zlp/cli.py` -- argparse surface and command handlers. Parser subcommand `foo-bar` dispatches to handler `cmd_foo_bar`. Commands that don't need a live Zulip client must be listed in `NO_CLIENT_COMMANDS`.
-- `src/zlp/format.py` -- rendering, slugging, archive file parsing/writing. Owns the YAML-frontmatter `.md` format under `mail/<stream>/<topic>/`.
-- `src/zlp/sync.py` -- event-queue sync loop and archive reconciliation helpers. Daemons drop pid/log files under `--run-root` (default `./run`).
+- `src/zlp/cli.py` -- argparse surface and command handlers. Parser subcommand `foo-bar` dispatches to handler `cmd_foo_bar`. Commands that don't need a live Zulip client must be listed in `NO_CLIENT_COMMANDS`. Cross-flag validation (e.g. `--topic` requires `--stream`, `--all-public` excludes `--stream`) lives in `validate_args()`.
+- `src/zlp/format.py` -- rendering, slugging, archive file parsing/writing. Owns the YAML-frontmatter `.md` format under `mail/<stream-slug>/<topic-slug | _all>/`.
+- `src/zlp/sync.py` -- event-queue sync loop, archive reconciliation, and daemon process management. `pull` and `sync` operate at two scopes: workspace-wide (default, all subscribed streams) and stream-narrowed (with `--stream`). Daemons drop pid/log files under `--run-root` (default `./run`); the workspace daemon and per-stream daemons coexist. Tail those log files directly — there is no `sync-log` subcommand.
 - `tests/` -- unittest suite; uses `TemporaryDirectory` for filesystem state and `unittest.mock` for Zulip clients. Tests must not require real credentials or network access.
 - `.github/workflows/ci.yml` -- test matrix, lint, and distribution build checks.
 
@@ -52,7 +54,12 @@ uv run zlp messages --stream general --limit 5
 
 - Commands that read or write the archive should honor `--archive-root` (env: `ZLP_ARCHIVE_ROOT`).
 - Daemon commands should honor `--run-root` (env: `ZLP_RUN_ROOT`).
-- User-facing output should stay easy to parse: TSV for status tables, Markdown for human message views, and JSON where a command exposes `--format json`.
+- `pull` and `sync` default to workspace scope; `--stream [--topic]` narrows. `--all-public` widens to all public streams and is mutually exclusive with `--stream`.
+- Long-running archive commands (`pull`, `sync`) print archived file paths by default; pass `--silent` to suppress.
+- Boolean flags use presence-style: `--silent`, `--all-public`, `--import-history`, `--no-attachments`, `--daemon`. Don't add `--foo 0|1` choices.
+- Body-input commands accept `--msg M | --msg-file F` (use `-` for stdin); `upload` treats the body as optional via `optional_body()`.
+- User-facing output should stay easy to parse: TSV for status tables, Markdown for human message views, JSON where a command exposes `--format json`. Success lines follow `ok key=value` (e.g. `ok archived=N`, `ok reconciled=N`, `ok id=N`); daemon-stop uses bare words (`stopped` / `stale` / `killed`).
+- New cross-flag rules belong in `validate_args()`, not scattered in handlers.
 
 ## Testing Requirements
 

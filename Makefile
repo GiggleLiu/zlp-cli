@@ -6,7 +6,7 @@ STREAM ?= $(CHANNEL)
 require = $(if $($(1)),,$(error $(1) is required))
 require_msg = $(if $(or $(MSG),$(MSG_FILE)),,$(error MSG or MSG_FILE is required))
 
-.PHONY: install help fmt fmt-check lint build check clean whoami streams topics messages search send dm edit delete upload pull sync sync-fg unsync sync-status sync-log refresh inbox grep test
+.PHONY: install help fmt fmt-check lint build check clean whoami streams topics messages search send dm edit delete upload pull sync unsync sync-status reconcile test
 
 install:
 	uv sync --extra dev
@@ -31,14 +31,10 @@ help:
 	'delete        delete message ID' \
 	'upload        upload FILE and post link to STREAM > TOPIC' \
 	'pull          one-shot archive catchup' \
-	'sync          start background sync daemon' \
-	'sync-fg       run sync daemon in foreground' \
+	'sync          live event-queue sync (foreground; pass DAEMON=1 for background)' \
 	'unsync        stop sync daemon' \
 	'sync-status   list sync targets and daemon state' \
-	'sync-log      show daemon log tail' \
-	'refresh       reconcile recent archived messages' \
-	'inbox         render recent archived messages offline' \
-	'grep          search local archive offline' \
+	'reconcile     re-fetch recent archived messages to catch edits/deletes' \
 	'test          run unit tests'
 
 fmt:
@@ -100,42 +96,23 @@ upload:
 	$(call require,FILE)
 	$(call require,STREAM)
 	$(call require,TOPIC)
-	$(ZLP) upload --file "$(FILE)" --stream "$(STREAM)" --topic "$(TOPIC)" $(if $(MSG),--msg "$(MSG)")
+	$(ZLP) upload --file "$(FILE)" --stream "$(STREAM)" --topic "$(TOPIC)" $(if $(MSG),--msg "$(MSG)") $(if $(MSG_FILE),--msg-file "$(MSG_FILE)")
 
 pull:
-	$(call require,STREAM)
-	$(ZLP) pull --stream "$(STREAM)" $(if $(TOPIC),--topic "$(TOPIC)") --import-history "$(or $(IMPORT_HISTORY),0)" --attachments "$(or $(ATTACHMENTS),1)"
+	$(ZLP) pull $(if $(STREAM),--stream "$(STREAM)") $(if $(TOPIC),--topic "$(TOPIC)") $(if $(ALL_PUBLIC),--all-public) $(if $(IMPORT_HISTORY),--import-history) $(if $(NO_ATTACHMENTS),--no-attachments) $(if $(SILENT),--silent)
 
 sync:
-	$(call require,STREAM)
-	$(ZLP) sync --stream "$(STREAM)" $(if $(TOPIC),--topic "$(TOPIC)") --attachments "$(or $(ATTACHMENTS),1)"
-
-sync-fg:
-	$(call require,STREAM)
-	$(ZLP) sync-fg --stream "$(STREAM)" $(if $(TOPIC),--topic "$(TOPIC)") --attachments "$(or $(ATTACHMENTS),1)"
+	$(ZLP) sync $(if $(STREAM),--stream "$(STREAM)") $(if $(TOPIC),--topic "$(TOPIC)") $(if $(ALL_PUBLIC),--all-public) $(if $(NO_ATTACHMENTS),--no-attachments) $(if $(SILENT),--silent) $(if $(DAEMON),--daemon)
 
 unsync:
-	$(call require,STREAM)
-	$(ZLP) unsync --stream "$(STREAM)" $(if $(TOPIC),--topic "$(TOPIC)")
+	$(ZLP) unsync $(if $(STREAM),--stream "$(STREAM)") $(if $(TOPIC),--topic "$(TOPIC)")
 
 sync-status:
 	$(ZLP) sync-status
 
-sync-log:
+reconcile:
 	$(call require,STREAM)
-	$(ZLP) sync-log --stream "$(STREAM)" $(if $(TOPIC),--topic "$(TOPIC)") --lines "$(or $(LINES),50)"
-
-refresh:
-	$(call require,STREAM)
-	$(ZLP) refresh --stream "$(STREAM)" $(if $(TOPIC),--topic "$(TOPIC)") --since "$(or $(SINCE),24h)"
-
-inbox:
-	$(call require,STREAM)
-	$(ZLP) inbox --stream "$(STREAM)" $(if $(TOPIC),--topic "$(TOPIC)") --limit "$(or $(LIMIT),20)"
-
-grep:
-	$(call require,QUERY)
-	$(ZLP) grep --query "$(QUERY)" $(if $(STREAM),--stream "$(STREAM)") $(if $(TOPIC),--topic "$(TOPIC)")
+	$(ZLP) reconcile --stream "$(STREAM)" $(if $(TOPIC),--topic "$(TOPIC)") --since "$(or $(SINCE),24h)"
 
 test:
 	$(PY) -m unittest discover -s tests

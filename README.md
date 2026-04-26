@@ -47,11 +47,22 @@ zlp streams
 zlp messages --stream general --limit 10
 zlp send --stream general --topic test --msg 'hello from zlp'
 
-# keep a local mirror of one stream
-zlp pull --stream general --import-history 1
-zlp sync --stream general                  # background daemon
-zlp inbox --stream general --limit 20      # offline render
-zlp grep --stream general --query "release notes"
+# run one incremental pass over subscribed workspace stream messages
+# prints archived file paths for messages written in this pass
+zlp pull
+
+# keep the local mirror current in the foreground (Ctrl-C to stop)
+zlp sync
+
+# ...or in the background as a daemon
+zlp sync --daemon
+tail -f run/_workspace.log                 # daemon log with archived file paths
+
+# or narrow sync to one stream
+zlp pull --stream general --import-history
+zlp pull --stream general                  # one incremental stream pass
+zlp sync --daemon --stream general         # background stream daemon
+tail -f run/general__*.log                 # stream daemon log
 ```
 
 For multi-line message bodies pipe stdin: `zlp send ... --msg-file -`.
@@ -83,16 +94,12 @@ locations — `zlp` itself stays workspace-agnostic.
 | `zlp dm --to EMAIL[,EMAIL] (--msg \| --msg-file)` | Send a direct message. |
 | `zlp edit --id N (--msg \| --msg-file)` | Edit your own message. |
 | `zlp delete --id N` | Delete your own message. |
-| `zlp upload --file F --stream S --topic T [--msg M]` | Upload a file and post the link. |
-| `zlp pull --stream S [--topic T] [--import-history 0\|1] [--attachments 0\|1]` | One-shot archive catchup. |
-| `zlp sync --stream S [--topic T] [--attachments 0\|1]` | Start background sync daemon. |
-| `zlp sync-fg --stream S ...` | Run sync in the foreground. |
-| `zlp unsync --stream S [--topic T]` | Stop a sync daemon. |
+| `zlp upload --file F --stream S --topic T [--msg M \| --msg-file F]` | Upload a file and post the link, with an optional message body. |
+| `zlp pull [--stream S [--topic T]] [--all-public] [--import-history] [--no-attachments] [--silent]` | One-shot archive catchup; defaults to subscribed workspace streams, or narrows to one stream. Prints archived file paths unless `--silent` is set. |
+| `zlp sync [--daemon] [--stream S [--topic T]] [--all-public] [--no-attachments] [--silent]` | Live event-queue sync. Foreground by default (Ctrl-C to stop); pass `--daemon` to run in the background. Defaults to subscribed workspace streams, or narrows to one stream. Prints archived file paths unless `--silent` is set. |
+| `zlp unsync [--stream S [--topic T]]` | Stop the workspace sync daemon, or a stream daemon when `--stream` is set. |
 | `zlp sync-status` | TSV of archive targets and daemon state. |
-| `zlp sync-log --stream S [--topic T] [--lines N]` | Show daemon log tail. |
-| `zlp refresh --stream S [--topic T] [--since 24h]` | Re-fetch recent archived messages. |
-| `zlp inbox --stream S [--topic T] [--limit N]` | Render recent archived messages from disk. |
-| `zlp grep --query Q [--stream S] [--topic T]` | Search the local archive (uses `rg` if installed). |
+| `zlp reconcile --stream S [--topic T] [--since 24h]` | Re-fetch recent archived messages to catch edits and deletes the daemon may have missed. |
 
 A `Makefile` is included for convenience (`make whoami`, `make send STREAM=...`, etc.).
 
@@ -109,9 +116,34 @@ mail/
         └── .sync-state.json                             # incremental cursor
 ```
 
+Workspace `zlp pull` and `zlp sync --daemon` write a workspace-level
+`.sync-state.json` directly under `mail/`; individual messages still land under
+their normal stream/topic directories. By default they follow the account's
+subscribed stream message feed, including subscribed private streams, and
+ignore direct messages. `--all-public` is an advanced mode for public channels
+beyond the account's subscriptions.
+
 Each `.md` file has YAML frontmatter (sender, ids, timestamp, permalink,
 attachments) followed by the message body. Edits rewrite in place; deletions
 move the file to `<name>.md.deleted` with `_archive.deleted: true`.
+
+Archive-writing commands emit stable TSV lines by default:
+
+```
+archived	<stream-slug>/<topic-slug>/<message-file>.md
+deleted	<stream-slug>/<topic-slug>/<message-file>.md.deleted
+```
+
+For background daemons, these lines are written to `run/*.log` (workspace daemon
+to `run/_workspace.log`, stream daemons to `run/<stream-slug>__<topic-slug>.log`).
+Tail those files directly. Pass `--silent` to suppress them.
+
+For agents, `zlp pull` is the normal "what changed since the last pull?" command:
+each `archived\t...` line is a file to read for that pass, followed by
+`ok archived=N`. The cursor is the archive's `.sync-state.json`; it tracks last
+pulled, not a separate per-agent read receipt. Use `zlp sync --daemon` only when
+you want continuous background mirroring; tail `run/_workspace.log` to inspect
+that daemon's output.
 
 ## For agent integrations
 
@@ -122,8 +154,8 @@ The CLI is designed to be the primitive layer below richer integrations:
   account by setting `ZULIP_CONFIG_FILE`, `ZLP_ARCHIVE_ROOT`, `ZLP_RUN_ROOT`.
 - **MCP / function-calling shells.** Subcommands map cleanly onto tool
   schemas; outputs are stable enough to feed back into a model.
-- **CI / cron jobs.** `pull` for snapshots, `sync` for live mirrors,
-  `refresh` for reconciliation.
+- **CI / cron jobs.** `pull` for snapshots and one-shot incremental catchup,
+  `sync --daemon` for live mirrors, `reconcile` for catching missed edits.
 
 ## Development
 

@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import signal
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -15,7 +14,7 @@ import zulip
 from .format import parse_archive_file, render_json, render_markdown, slugify
 
 
-NO_CLIENT_COMMANDS = {"sync-status", "sync-log", "inbox", "grep", "unsync", "sync", "sync-fg"}
+NO_CLIENT_COMMANDS = {"sync-status", "unsync", "sync"}
 
 
 def main() -> int:
@@ -76,52 +75,43 @@ def main() -> int:
     upload.add_argument("--stream", required=True)
     upload.add_argument("--topic", required=True)
     upload.add_argument("--msg")
+    upload.add_argument("--msg-file")
 
     pull = subparsers.add_parser("pull")
-    pull.add_argument("--stream", required=True)
+    pull.add_argument("--stream")
     pull.add_argument("--topic")
-    pull.add_argument("--import-history", choices=["0", "1"], default="0")
-    pull.add_argument("--attachments", choices=["0", "1"], default="1")
+    pull.add_argument("--import-history", action="store_true")
+    pull.add_argument("--no-attachments", dest="attachments", action="store_false")
+    pull.add_argument("--all-public", action="store_true")
+    pull.add_argument("--silent", action="store_true")
 
     sync = subparsers.add_parser("sync")
-    sync.add_argument("--stream", required=True)
+    sync.add_argument("--stream")
     sync.add_argument("--topic")
-    sync.add_argument("--attachments", choices=["0", "1"], default="1")
-
-    sync_fg = subparsers.add_parser("sync-fg")
-    sync_fg.add_argument("--stream", required=True)
-    sync_fg.add_argument("--topic")
-    sync_fg.add_argument("--attachments", choices=["0", "1"], default="1")
+    sync.add_argument("--no-attachments", dest="attachments", action="store_false")
+    sync.add_argument("--all-public", action="store_true")
+    sync.add_argument("--silent", action="store_true")
+    sync.add_argument("--daemon", action="store_true")
 
     unsync = subparsers.add_parser("unsync")
-    unsync.add_argument("--stream", required=True)
+    unsync.add_argument("--stream")
     unsync.add_argument("--topic")
 
     subparsers.add_parser("sync-status")
 
-    log = subparsers.add_parser("sync-log")
-    log.add_argument("--stream", required=True)
-    log.add_argument("--topic")
-    log.add_argument("--lines", type=int, default=50)
-
-    refresh = subparsers.add_parser("refresh")
-    refresh.add_argument("--stream", required=True)
-    refresh.add_argument("--topic")
-    refresh.add_argument("--since", default="24h")
-
-    inbox = subparsers.add_parser("inbox")
-    inbox.add_argument("--stream", required=True)
-    inbox.add_argument("--topic")
-    inbox.add_argument("--limit", type=int, default=20)
-
-    grep = subparsers.add_parser("grep")
-    grep.add_argument("--query", required=True)
-    grep.add_argument("--stream")
-    grep.add_argument("--topic")
+    reconcile = subparsers.add_parser("reconcile")
+    reconcile.add_argument("--stream", required=True)
+    reconcile.add_argument("--topic")
+    reconcile.add_argument("--since", default="24h")
 
     args = parser.parse_args()
     args.archive_root = Path(args.archive_root).resolve()
     args.run_root = Path(args.run_root).resolve()
+
+    validation_error = validate_args(args)
+    if validation_error:
+        print(f"error: {validation_error}", file=sys.stderr)
+        return 1
 
     client = None
     if args.command not in NO_CLIENT_COMMANDS:
@@ -147,6 +137,14 @@ def require_config(config: str) -> Path:
         file=sys.stderr,
     )
     raise SystemExit(1)
+
+
+def validate_args(args: argparse.Namespace) -> str | None:
+    if args.command in {"pull", "sync", "unsync"} and args.topic and not args.stream:
+        return "--topic requires --stream"
+    if args.command in {"pull", "sync"} and args.all_public and args.stream:
+        return "--all-public cannot be combined with --stream"
+    return None
 
 
 def check(resp: dict[str, Any]) -> dict[str, Any]:
@@ -255,8 +253,9 @@ def cmd_upload(client: zulip.Client, args: argparse.Namespace) -> int:
         resp = check(client.upload_file(handle))
     uri = resp.get("uri")
     content = f"[{path.name}]({uri})"
-    if args.msg:
-        content = f"{args.msg}\n\n{content}"
+    body = optional_body(args)
+    if body:
+        content = f"{body}\n\n{content}"
     sent = check(
         client.send_message({"type": "stream", "to": args.stream, "topic": args.topic, "content": content})
     )
@@ -265,36 +264,88 @@ def cmd_upload(client: zulip.Client, args: argparse.Namespace) -> int:
 
 
 def cmd_pull(client: zulip.Client, args: argparse.Namespace) -> int:
-    from .sync import catchup
+    from .sync import catchup, catchup_workspace
 
-    count = catchup(
-        client,
-        args.archive_root,
-        args.stream,
-        args.topic,
-        import_history=args.import_history == "1",
-        attachments=args.attachments == "1",
-    )
+    if not args.stream:
+        count = catchup_workspace(
+            client,
+            args.archive_root,
+            import_history=args.import_history,
+            attachments=args.attachments,
+            all_public_streams=args.all_public,
+            silent=args.silent,
+        )
+    else:
+        count = catchup(
+            client,
+            args.archive_root,
+            args.stream,
+            args.topic,
+            import_history=args.import_history,
+            attachments=args.attachments,
+            silent=args.silent,
+        )
     print(f"ok archived={count}")
     return 0
 
 
 def cmd_sync(client: zulip.Client, args: argparse.Namespace) -> int:
-    from .sync import start_background
+    from .sync import (
+        run_foreground,
+        run_workspace_foreground,
+        start_background,
+        start_workspace_background,
+    )
 
-    return start_background(
-        args.config, args.archive_root, args.run_root, args.stream, args.topic, args.attachments == "1"
+    if args.daemon:
+        if not args.stream:
+            return start_workspace_background(
+                args.config,
+                args.archive_root,
+                args.run_root,
+                args.attachments,
+                args.all_public,
+                args.silent,
+            )
+        return start_background(
+            args.config,
+            args.archive_root,
+            args.run_root,
+            args.stream,
+            args.topic,
+            args.attachments,
+            args.silent,
+        )
+    if not args.stream:
+        return run_workspace_foreground(
+            args.config,
+            args.archive_root,
+            args.attachments,
+            args.all_public,
+            args.silent,
+        )
+    return run_foreground(
+        args.config,
+        args.archive_root,
+        args.stream,
+        args.topic,
+        args.attachments,
+        args.silent,
     )
 
 
-def cmd_sync_fg(client: zulip.Client, args: argparse.Namespace) -> int:
-    from .sync import run_foreground
-
-    return run_foreground(args.config, args.archive_root, args.stream, args.topic, args.attachments == "1")
-
-
 def cmd_unsync(client: zulip.Client, args: argparse.Namespace) -> int:
-    pid_path = pid_file(args.run_root, args.stream, args.topic)
+    if not args.stream:
+        if args.topic:
+            print("error: --topic requires --stream", file=sys.stderr)
+            return 1
+        pid_path = workspace_pid_file(args.run_root)
+    else:
+        pid_path = pid_file(args.run_root, args.stream, args.topic)
+    return stop_daemon(pid_path)
+
+
+def stop_daemon(pid_path: Path) -> int:
     if not pid_path.exists():
         print("stopped")
         return 0
@@ -326,34 +377,26 @@ def cmd_sync_status(client: zulip.Client, args: argparse.Namespace) -> int:
     print("stream\ttopic\tlast_id\tdaemon\tpulled_files")
     if not args.archive_root.exists():
         return 0
+    workspace_state = workspace_state_file(args.archive_root)
+    if workspace_state.exists():
+        state = json.loads(workspace_state.read_text())
+        daemon = daemon_status(workspace_pid_file(args.run_root))
+        pulled = len(list(args.archive_root.rglob("*.md"))) + len(
+            list(args.archive_root.rglob("*.md.deleted"))
+        )
+        print(f"{state.get('stream', '*')}\t_all\t{state.get('last_message_id', 0)}\t{daemon}\t{pulled}")
     for state_path in sorted(args.archive_root.glob("*/*/.sync-state.json")):
         state = json.loads(state_path.read_text())
         stream = state.get("stream", "")
         topic = state.get("topic") or "_all"
         pid_path = pid_file(args.run_root, stream, state.get("topic"))
-        daemon = "stopped"
-        if pid_path.exists():
-            try:
-                daemon = "alive" if process_alive(int(pid_path.read_text().strip())) else "stale"
-            except ValueError:
-                daemon = "stale"
+        daemon = daemon_status(pid_path)
         pulled = len(list(state_path.parent.glob("*.md"))) + len(list(state_path.parent.glob("*.md.deleted")))
         print(f"{stream}\t{topic}\t{state.get('last_message_id', 0)}\t{daemon}\t{pulled}")
     return 0
 
 
-def cmd_sync_log(client: zulip.Client, args: argparse.Namespace) -> int:
-    path = log_file(args.run_root, args.stream, args.topic)
-    if not path.exists():
-        print(f"error: no log file at {path}", file=sys.stderr)
-        return 1
-    lines = path.read_text(errors="replace").splitlines()
-    for line in lines[-args.lines :]:
-        print(line)
-    return 0
-
-
-def cmd_refresh(client: zulip.Client, args: argparse.Namespace) -> int:
+def cmd_reconcile(client: zulip.Client, args: argparse.Namespace) -> int:
     from .sync import archive_message, fetch_message_by_id, parse_since
 
     cutoff = time.time() - parse_since(args.since)
@@ -371,46 +414,26 @@ def cmd_refresh(client: zulip.Client, args: argparse.Namespace) -> int:
             continue
         archive_message(client, fresh, args.archive_root, args.stream, args.topic, attachments=False)
         rewritten += 1
-    print(f"ok refreshed={rewritten}")
-    return 0
-
-
-def cmd_inbox(client: zulip.Client, args: argparse.Namespace) -> int:
-    target = target_dir(args.archive_root, args.stream, args.topic)
-    paths = sorted(target.glob("*.md"), key=lambda path: path.stat().st_mtime, reverse=True)[: args.limit]
-    messages = [parse_archive_file(path) for path in reversed(paths)]
-    print(render_markdown(messages, args.stream, args.topic))
-    return 0
-
-
-def cmd_grep(client: zulip.Client, args: argparse.Namespace) -> int:
-    base = args.archive_root
-    if args.stream:
-        base = base / slugify(args.stream)
-    if args.topic:
-        base = base / slugify(args.topic)
-    if not base.exists():
-        return 1
-    rg = shutil_which("rg")
-    if rg:
-        return subprocess.call([rg, args.query, str(base)])
-    for path in base.rglob("*.md"):
-        text = path.read_text(errors="replace")
-        for number, line in enumerate(text.splitlines(), 1):
-            if args.query in line:
-                print(f"{path}:{number}:{line}")
+    print(f"ok reconciled={rewritten}")
     return 0
 
 
 def read_body(args: argparse.Namespace) -> str:
+    body = optional_body(args)
+    if body is None:
+        print("error: MSG or MSG_FILE is required", file=sys.stderr)
+        raise SystemExit(1)
+    return body
+
+
+def optional_body(args: argparse.Namespace) -> str | None:
     if args.msg is not None:
         return args.msg
     if args.msg_file:
         if args.msg_file == "-":
             return sys.stdin.read()
         return Path(args.msg_file).read_text(encoding="utf-8")
-    print("error: MSG or MSG_FILE is required", file=sys.stderr)
-    raise SystemExit(1)
+    return None
 
 
 def print_rendered(messages: list[dict[str, Any]], fmt: str, stream: str | None, topic: str | None) -> None:
@@ -448,8 +471,21 @@ def pid_file(run_root: Path, stream: str, topic: str | None) -> Path:
     return run_root / f"{slugify(stream)}__{slugify(topic) if topic else '_all'}.pid"
 
 
-def log_file(run_root: Path, stream: str, topic: str | None) -> Path:
-    return run_root / f"{slugify(stream)}__{slugify(topic) if topic else '_all'}.log"
+def workspace_state_file(archive_root: Path) -> Path:
+    return archive_root / ".sync-state.json"
+
+
+def workspace_pid_file(run_root: Path) -> Path:
+    return run_root / "_workspace.pid"
+
+
+def daemon_status(pid_path: Path) -> str:
+    if not pid_path.exists():
+        return "stopped"
+    try:
+        return "alive" if process_alive(int(pid_path.read_text().strip())) else "stale"
+    except ValueError:
+        return "stale"
 
 
 def process_alive(pid: int) -> bool:
@@ -460,11 +496,3 @@ def process_alive(pid: int) -> bool:
         return True
     except ProcessLookupError:
         return False
-
-
-def shutil_which(binary: str) -> str | None:
-    for item in os.environ.get("PATH", "").split(os.pathsep):
-        candidate = Path(item) / binary
-        if candidate.exists() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    return None

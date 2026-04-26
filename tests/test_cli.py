@@ -45,7 +45,7 @@ class HelpAndUsageTests(unittest.TestCase):
                 cli.main()
             self.assertEqual(ctx.exception.code, 0)
             text = buf.getvalue()
-            for cmd in ("whoami", "send", "messages", "sync", "inbox", "grep"):
+            for cmd in ("whoami", "send", "messages", "pull", "sync", "unsync"):
                 self.assertIn(cmd, text)
 
     def test_missing_subcommand_exits_with_error(self):
@@ -110,22 +110,217 @@ class ClientFreeCommandTests(unittest.TestCase):
                 self.assertEqual(rc, 0)
                 self.assertIn("stream\ttopic", buf.getvalue())
 
-    def test_grep_returns_nonzero_when_archive_missing(self):
+    def test_pull_without_stream_runs_workspace_catchup(self):
         with TemporaryDirectory() as dirname:
-            with patched_argv(
-                [
-                    "zlp",
-                    "--archive-root",
-                    str(Path(dirname) / "missing"),
-                    "--run-root",
-                    dirname,
-                    "grep",
-                    "--query",
-                    "anything",
-                ]
+            config = Path(dirname) / "zuliprc"
+            config.write_text("[api]\nemail=bot@example.com\nkey=x\nsite=https://example.zulipchat.com\n")
+            fake_client = mock.Mock()
+            argv = [
+                "zlp",
+                "--config",
+                str(config),
+                "--archive-root",
+                str(Path(dirname) / "mail"),
+                "--run-root",
+                str(Path(dirname) / "run"),
+                "pull",
+            ]
+            with (
+                patched_argv(argv),
+                mock.patch("zlp.cli.zulip.Client", return_value=fake_client) as client_ctor,
+                mock.patch("zlp.sync.catchup_workspace", return_value=2) as catchup,
+            ):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = cli.main()
+
+            self.assertEqual(rc, 0)
+            client_ctor.assert_called_once_with(config_file=str(config))
+            catchup.assert_called_once_with(
+                fake_client,
+                (Path(dirname) / "mail").resolve(),
+                import_history=False,
+                attachments=True,
+                all_public_streams=False,
+                silent=False,
+            )
+            self.assertEqual(buf.getvalue(), "ok archived=2\n")
+
+    def test_sync_with_daemon_flag_starts_workspace_daemon(self):
+        with TemporaryDirectory() as dirname:
+            config = Path(dirname) / "zuliprc"
+            config.write_text("[api]\nemail=bot@example.com\nkey=x\nsite=https://example.zulipchat.com\n")
+            argv = [
+                "zlp",
+                "--config",
+                str(config),
+                "--archive-root",
+                str(Path(dirname) / "mail"),
+                "--run-root",
+                str(Path(dirname) / "run"),
+                "sync",
+                "--daemon",
+            ]
+            with (
+                patched_argv(argv),
+                mock.patch("zlp.cli.zulip.Client") as client_ctor,
+                mock.patch("zlp.sync.start_workspace_background", return_value=0) as start,
             ):
                 rc = cli.main()
-                self.assertEqual(rc, 1)
+
+            self.assertEqual(rc, 0)
+            client_ctor.assert_not_called()
+            start.assert_called_once_with(
+                str(config),
+                (Path(dirname) / "mail").resolve(),
+                (Path(dirname) / "run").resolve(),
+                True,
+                False,
+                False,
+            )
+
+    def test_sync_without_daemon_runs_workspace_foreground(self):
+        with TemporaryDirectory() as dirname:
+            config = Path(dirname) / "zuliprc"
+            config.write_text("[api]\nemail=bot@example.com\nkey=x\nsite=https://example.zulipchat.com\n")
+            argv = [
+                "zlp",
+                "--config",
+                str(config),
+                "--archive-root",
+                str(Path(dirname) / "mail"),
+                "--run-root",
+                str(Path(dirname) / "run"),
+                "sync",
+            ]
+            with (
+                patched_argv(argv),
+                mock.patch("zlp.cli.zulip.Client") as client_ctor,
+                mock.patch("zlp.sync.run_workspace_foreground", return_value=0) as run_ws,
+            ):
+                rc = cli.main()
+
+            self.assertEqual(rc, 0)
+            client_ctor.assert_not_called()
+            run_ws.assert_called_once_with(
+                str(config),
+                (Path(dirname) / "mail").resolve(),
+                True,
+                False,
+                False,
+            )
+
+    def test_pull_can_request_all_public_streams_for_workspace_catchup(self):
+        with TemporaryDirectory() as dirname:
+            config = Path(dirname) / "zuliprc"
+            config.write_text("[api]\nemail=bot@example.com\nkey=x\nsite=https://example.zulipchat.com\n")
+            fake_client = mock.Mock()
+            argv = [
+                "zlp",
+                "--config",
+                str(config),
+                "--archive-root",
+                str(Path(dirname) / "mail"),
+                "--run-root",
+                str(Path(dirname) / "run"),
+                "pull",
+                "--all-public",
+            ]
+            with (
+                patched_argv(argv),
+                mock.patch("zlp.cli.zulip.Client", return_value=fake_client),
+                mock.patch("zlp.sync.catchup_workspace", return_value=0) as catchup,
+            ):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = cli.main()
+
+            self.assertEqual(rc, 0)
+            catchup.assert_called_once_with(
+                fake_client,
+                (Path(dirname) / "mail").resolve(),
+                import_history=False,
+                attachments=True,
+                all_public_streams=True,
+                silent=False,
+            )
+
+    def test_pull_rejects_topic_without_stream(self):
+        with TemporaryDirectory() as dirname:
+            argv = [
+                "zlp",
+                "--archive-root",
+                str(Path(dirname) / "mail"),
+                "--run-root",
+                str(Path(dirname) / "run"),
+                "pull",
+                "--topic",
+                "launch",
+            ]
+            with patched_argv(argv):
+                buf = io.StringIO()
+                with redirect_stderr(buf):
+                    rc = cli.main()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("--topic requires --stream", buf.getvalue())
+
+    def test_sync_daemon_silent_suppresses_workspace_archive_path_logging(self):
+        with TemporaryDirectory() as dirname:
+            config = Path(dirname) / "zuliprc"
+            config.write_text("[api]\nemail=bot@example.com\nkey=x\nsite=https://example.zulipchat.com\n")
+            argv = [
+                "zlp",
+                "--config",
+                str(config),
+                "--archive-root",
+                str(Path(dirname) / "mail"),
+                "--run-root",
+                str(Path(dirname) / "run"),
+                "sync",
+                "--daemon",
+                "--silent",
+            ]
+            with (
+                patched_argv(argv),
+                mock.patch("zlp.sync.start_workspace_background", return_value=0) as start,
+            ):
+                rc = cli.main()
+
+            self.assertEqual(rc, 0)
+            start.assert_called_once_with(
+                str(config),
+                (Path(dirname) / "mail").resolve(),
+                (Path(dirname) / "run").resolve(),
+                True,
+                False,
+                True,
+            )
+
+    def test_unsync_without_stream_stops_workspace_daemon(self):
+        with TemporaryDirectory() as dirname:
+            run_root = Path(dirname) / "run"
+            run_root.mkdir()
+            (run_root / "_workspace.pid").write_text("12345")
+            argv = [
+                "zlp",
+                "--archive-root",
+                str(Path(dirname) / "mail"),
+                "--run-root",
+                str(run_root),
+                "unsync",
+            ]
+            with (
+                patched_argv(argv),
+                mock.patch("zlp.cli.process_alive", return_value=False),
+            ):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = cli.main()
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(buf.getvalue().strip(), "stale")
+            self.assertFalse((run_root / "_workspace.pid").exists())
 
 
 class WhoamiTests(unittest.TestCase):

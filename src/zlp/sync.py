@@ -18,6 +18,7 @@ from .format import atomic_write, slugify, write_archive_file
 
 UPLOAD_RE = re.compile(r"(?P<url>/user_uploads/[^\s)>\"]+)")
 STOP = False
+WORKSPACE_STREAM = "*"
 
 
 def catchup(
@@ -27,6 +28,7 @@ def catchup(
     topic: str | None,
     import_history: bool = False,
     attachments: bool = True,
+    silent: bool = False,
 ) -> int:
     state = load_state(archive_root, stream, topic)
     if not state:
@@ -54,10 +56,51 @@ def catchup(
         )
         messages = sorted(resp.get("messages", []), key=lambda item: item.get("id", 0))
         for message in messages:
-            archive_message(client, message, archive_root, stream, topic if topic else "_all", attachments)
+            path = archive_message(
+                client, message, archive_root, stream, topic if topic else "_all", attachments
+            )
+            report_archive_path(archive_root, path, silent=silent)
             state["last_message_id"] = max(int(state.get("last_message_id", 0)), int(message["id"]))
             archived += 1
         save_state(archive_root, stream, topic, state)
+        if resp.get("found_newest", True) or not messages:
+            break
+    return archived
+
+
+def catchup_workspace(
+    client: zulip.Client,
+    archive_root: Path,
+    import_history: bool = False,
+    attachments: bool = True,
+    all_public_streams: bool = False,
+    silent: bool = False,
+) -> int:
+    state = load_workspace_state(archive_root)
+    if not state:
+        state = initial_workspace_state(client, all_public_streams)
+        if import_history:
+            state["last_message_id"] = 0
+        else:
+            state["last_message_id"] = newest_workspace_message_id(client, all_public_streams)
+            save_workspace_state(archive_root, state)
+            return 0
+
+    archived = 0
+    while True:
+        resp = check(
+            client.get_messages(
+                workspace_messages_request(state.get("last_message_id", 0), all_public_streams)
+            )
+        )
+        messages = sorted(resp.get("messages", []), key=lambda item: item.get("id", 0))
+        for message in messages:
+            if is_stream_message(message):
+                path = archive_message(client, message, archive_root, None, None, attachments)
+                report_archive_path(archive_root, path, silent=silent)
+                archived += 1
+            state["last_message_id"] = max(int(state.get("last_message_id", 0)), int(message["id"]))
+        save_workspace_state(archive_root, state)
         if resp.get("found_newest", True) or not messages:
             break
     return archived
@@ -70,6 +113,7 @@ def start_background(
     stream: str,
     topic: str | None,
     attachments: bool,
+    silent: bool = False,
 ) -> int:
     pid_path = pid_file(run_root, stream, topic)
     log_path = log_file(run_root, stream, topic)
@@ -99,7 +143,56 @@ def start_background(
         os.dup2(log.fileno(), sys.stderr.fileno())
         pid_path.write_text(str(os.getpid()))
         try:
-            raise SystemExit(run_foreground(config, archive_root, stream, topic, attachments))
+            raise SystemExit(run_foreground(config, archive_root, stream, topic, attachments, silent=silent))
+        finally:
+            pid_path.unlink(missing_ok=True)
+
+
+def start_workspace_background(
+    config: str,
+    archive_root: Path,
+    run_root: Path,
+    attachments: bool,
+    all_public_streams: bool = False,
+    silent: bool = False,
+) -> int:
+    pid_path = workspace_pid_file(run_root)
+    log_path = workspace_log_file(run_root)
+    run_root.mkdir(parents=True, exist_ok=True)
+    if pid_path.exists():
+        try:
+            pid = int(pid_path.read_text().strip())
+            if process_alive(pid):
+                print(f"already running pid={pid}")
+                return 0
+        except ValueError:
+            pass
+        pid_path.unlink(missing_ok=True)
+
+    first = os.fork()
+    if first > 0:
+        time.sleep(0.2)
+        pid = pid_path.read_text().strip() if pid_path.exists() else ""
+        print(f"started pid={pid}")
+        return 0
+    os.setsid()
+    second = os.fork()
+    if second > 0:
+        os._exit(0)
+    with log_path.open("a", buffering=1) as log:
+        os.dup2(log.fileno(), sys.stdout.fileno())
+        os.dup2(log.fileno(), sys.stderr.fileno())
+        pid_path.write_text(str(os.getpid()))
+        try:
+            raise SystemExit(
+                run_workspace_foreground(
+                    config,
+                    archive_root,
+                    attachments,
+                    all_public_streams,
+                    silent=silent,
+                )
+            )
         finally:
             pid_path.unlink(missing_ok=True)
 
@@ -110,6 +203,7 @@ def run_foreground(
     stream: str,
     topic: str | None,
     attachments: bool,
+    silent: bool = False,
 ) -> int:
     global STOP
 
@@ -131,7 +225,15 @@ def run_foreground(
         state = load_state(archive_root, stream, topic) or initial_state(client, stream, topic)
         state["last_event_id"] = last_event_id
         save_state(archive_root, stream, topic, state)
-        catchup(client, archive_root, stream, topic, import_history=False, attachments=attachments)
+        catchup(
+            client,
+            archive_root,
+            stream,
+            topic,
+            import_history=False,
+            attachments=attachments,
+            silent=silent,
+        )
         while not STOP:
             events_resp = client.get_events(queue_id=queue_id, last_event_id=last_event_id)
             if events_resp.get("code") == "BAD_EVENT_QUEUE_ID":
@@ -139,12 +241,67 @@ def run_foreground(
             check(events_resp)
             events = events_resp.get("events", [])
             for event in events:
-                handle_event(client, event, archive_root, stream, topic, attachments)
+                handle_event(client, event, archive_root, stream, topic, attachments, silent=silent)
                 last_event_id = event["id"]
             if events:
                 state = load_state(archive_root, stream, topic) or initial_state(client, stream, topic)
                 state["last_event_id"] = last_event_id
                 save_state(archive_root, stream, topic, state)
+    return 0
+
+
+def run_workspace_foreground(
+    config: str,
+    archive_root: Path,
+    attachments: bool,
+    all_public_streams: bool = False,
+    silent: bool = False,
+) -> int:
+    global STOP
+
+    def handle_term(signum: int, frame: Any) -> None:
+        global STOP
+        STOP = True
+
+    signal.signal(signal.SIGTERM, handle_term)
+    signal.signal(signal.SIGINT, handle_term)
+    client = zulip.Client(config_file=config)
+
+    while not STOP:
+        registered = check(
+            client.register(
+                event_types=["message", "update_message", "delete_message"],
+                all_public_streams=all_public_streams,
+            )
+        )
+        queue_id = registered["queue_id"]
+        last_event_id = registered.get("last_event_id", -1)
+        state = load_workspace_state(archive_root) or initial_workspace_state(client, all_public_streams)
+        state["last_event_id"] = last_event_id
+        save_workspace_state(archive_root, state)
+        catchup_workspace(
+            client,
+            archive_root,
+            import_history=False,
+            attachments=attachments,
+            all_public_streams=all_public_streams,
+            silent=silent,
+        )
+        while not STOP:
+            events_resp = client.get_events(queue_id=queue_id, last_event_id=last_event_id)
+            if events_resp.get("code") == "BAD_EVENT_QUEUE_ID":
+                break
+            check(events_resp)
+            events = events_resp.get("events", [])
+            for event in events:
+                handle_workspace_event(client, event, archive_root, attachments, silent=silent)
+                last_event_id = event["id"]
+            if events:
+                state = load_workspace_state(archive_root) or initial_workspace_state(
+                    client, all_public_streams
+                )
+                state["last_event_id"] = last_event_id
+                save_workspace_state(archive_root, state)
     return 0
 
 
@@ -155,12 +312,16 @@ def handle_event(
     stream: str,
     topic: str | None,
     attachments: bool,
+    silent: bool = False,
 ) -> None:
     event_type = event.get("type")
     if event_type == "message":
         message = event.get("message")
         if message:
-            archive_message(client, message, archive_root, stream, topic if topic else "_all", attachments)
+            path = archive_message(
+                client, message, archive_root, stream, topic if topic else "_all", attachments
+            )
+            report_archive_path(archive_root, path, silent=silent)
             state = load_state(archive_root, stream, topic) or initial_state(client, stream, topic)
             state["last_message_id"] = max(int(state.get("last_message_id", 0)), int(message["id"]))
             save_state(archive_root, stream, topic, state)
@@ -171,11 +332,48 @@ def handle_event(
             if message is None:
                 continue
             new_path = archive_message(client, message, archive_root, None, None, attachments)
+            report_archive_path(archive_root, new_path, silent=silent)
             if old_path and old_path != new_path:
                 old_path.unlink(missing_ok=True)
     elif event_type == "delete_message":
         for message_id in event_message_ids(event):
-            mark_deleted(archive_root, message_id)
+            report_archive_path(
+                archive_root, mark_deleted(archive_root, message_id), action="deleted", silent=silent
+            )
+
+
+def handle_workspace_event(
+    client: zulip.Client,
+    event: dict[str, Any],
+    archive_root: Path,
+    attachments: bool,
+    silent: bool = False,
+) -> None:
+    event_type = event.get("type")
+    if event_type == "message":
+        message = event.get("message")
+        if message:
+            if is_stream_message(message):
+                path = archive_message(client, message, archive_root, None, None, attachments)
+                report_archive_path(archive_root, path, silent=silent)
+            state = load_workspace_state(archive_root) or initial_workspace_state(client)
+            state["last_message_id"] = max(int(state.get("last_message_id", 0)), int(message["id"]))
+            save_workspace_state(archive_root, state)
+    elif event_type == "update_message":
+        for message_id in event_message_ids(event):
+            old_path = find_archived_message(archive_root, message_id)
+            message = fetch_message_by_id(client, message_id)
+            if message is None or not is_stream_message(message):
+                continue
+            new_path = archive_message(client, message, archive_root, None, None, attachments)
+            report_archive_path(archive_root, new_path, silent=silent)
+            if old_path and old_path != new_path:
+                old_path.unlink(missing_ok=True)
+    elif event_type == "delete_message":
+        for message_id in event_message_ids(event):
+            report_archive_path(
+                archive_root, mark_deleted(archive_root, message_id), action="deleted", silent=silent
+            )
 
 
 def archive_message(
@@ -237,13 +435,13 @@ def fetch_message_by_id(client: zulip.Client, message_id: int) -> dict[str, Any]
     return None
 
 
-def mark_deleted(archive_root: Path, message_id: int) -> None:
+def mark_deleted(archive_root: Path, message_id: int) -> Path | None:
     path = find_archived_message(archive_root, message_id)
     if path is None:
-        return
+        return None
     text = path.read_text(encoding="utf-8")
     if not text.startswith("---\n"):
-        return
+        return None
     _, rest = text.split("---\n", 1)
     frontmatter_text, body = rest.split("\n---\n\n", 1)
     import yaml
@@ -255,6 +453,7 @@ def mark_deleted(archive_root: Path, message_id: int) -> None:
     deleted_path = path.with_suffix(path.suffix + ".deleted")
     atomic_write(deleted_path, f"---\n{yaml_text}---\n\n{body}")
     path.unlink(missing_ok=True)
+    return deleted_path
 
 
 def initial_state(client: zulip.Client, stream: str, topic: str | None) -> dict[str, Any]:
@@ -264,6 +463,18 @@ def initial_state(client: zulip.Client, stream: str, topic: str | None) -> dict[
         "stream": stream,
         "stream_id": stream_id_for_name(client, stream),
         "topic": topic,
+        "self_email": profile.get("email") or profile.get("delivery_email") or client.email,
+        "last_message_id": 0,
+    }
+
+
+def initial_workspace_state(client: zulip.Client, all_public_streams: bool = False) -> dict[str, Any]:
+    profile = check(client.get_profile())
+    return {
+        "site": client.base_url.removesuffix("/api/"),
+        "stream": WORKSPACE_STREAM,
+        "topic": None,
+        "scope": "all_public_streams" if all_public_streams else "subscribed_streams",
         "self_email": profile.get("email") or profile.get("delivery_email") or client.email,
         "last_message_id": 0,
     }
@@ -285,8 +496,25 @@ def newest_message_id(client: zulip.Client, stream: str, topic: str | None) -> i
     return max((int(message["id"]) for message in messages), default=0)
 
 
+def newest_workspace_message_id(client: zulip.Client, all_public_streams: bool = False) -> int:
+    request = workspace_messages_request("newest", all_public_streams)
+    request["num_before"] = 1
+    request["num_after"] = 0
+    request.pop("include_anchor", None)
+    resp = check(client.get_messages(request))
+    messages = resp.get("messages", [])
+    return max((int(message["id"]) for message in messages), default=0)
+
+
 def load_state(archive_root: Path, stream: str, topic: str | None) -> dict[str, Any] | None:
     path = state_file(archive_root, stream, topic)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
+def load_workspace_state(archive_root: Path) -> dict[str, Any] | None:
+    path = workspace_state_file(archive_root)
     if not path.exists():
         return None
     return json.loads(path.read_text())
@@ -296,8 +524,16 @@ def save_state(archive_root: Path, stream: str, topic: str | None, state: dict[s
     atomic_write(state_file(archive_root, stream, topic), json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
+def save_workspace_state(archive_root: Path, state: dict[str, Any]) -> None:
+    atomic_write(workspace_state_file(archive_root), json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
 def state_file(archive_root: Path, stream: str, topic: str | None) -> Path:
     return target_dir(archive_root, stream, topic) / ".sync-state.json"
+
+
+def workspace_state_file(archive_root: Path) -> Path:
+    return archive_root / ".sync-state.json"
 
 
 def target_dir(archive_root: Path, stream: str, topic: str | None) -> Path:
@@ -308,8 +544,16 @@ def pid_file(run_root: Path, stream: str, topic: str | None) -> Path:
     return run_root / f"{slugify(stream)}__{slugify(topic) if topic else '_all'}.pid"
 
 
+def workspace_pid_file(run_root: Path) -> Path:
+    return run_root / "_workspace.pid"
+
+
 def log_file(run_root: Path, stream: str, topic: str | None) -> Path:
     return run_root / f"{slugify(stream)}__{slugify(topic) if topic else '_all'}.log"
+
+
+def workspace_log_file(run_root: Path) -> Path:
+    return run_root / "_workspace.log"
 
 
 def stream_id_for_name(client: zulip.Client, stream: str) -> int:
@@ -329,6 +573,38 @@ def narrow_for(stream: str, topic: str | None = None) -> list[list[str]]:
     if topic:
         narrow.append(["topic", topic])
     return narrow
+
+
+def is_stream_message(message: dict[str, Any]) -> bool:
+    return message.get("type") == "stream" or isinstance(message.get("display_recipient"), str)
+
+
+def workspace_messages_request(anchor: Any, all_public_streams: bool) -> dict[str, Any]:
+    request = {
+        "anchor": anchor,
+        "include_anchor": False,
+        "num_before": 0,
+        "num_after": 5000,
+        "apply_markdown": False,
+    }
+    if all_public_streams:
+        request["narrow"] = [{"operator": "channels", "operand": "public"}]
+    return request
+
+
+def report_archive_path(
+    archive_root: Path,
+    path: Path | None,
+    action: str = "archived",
+    silent: bool = False,
+) -> None:
+    if silent or path is None:
+        return
+    try:
+        display_path = path.relative_to(archive_root)
+    except ValueError:
+        display_path = path
+    print(f"{action}\t{display_path}", flush=True)
 
 
 def check(resp: dict[str, Any]) -> dict[str, Any]:
