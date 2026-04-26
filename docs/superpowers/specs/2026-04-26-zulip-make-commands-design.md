@@ -5,16 +5,29 @@
 
 ## Goal
 
-Provide a small, ergonomic `make`-driven toolkit for reading and writing
-Zulip stream messages across multiple Zulip workspaces, starting with
+Provide a small, ergonomic `make`-driven toolkit for reading, writing,
+and **locally archiving with incremental background sync** Zulip stream
+messages across multiple Zulip workspaces, starting with
 `https://quantum-info.zulipchat.com`. Every operation is one make target;
-all state lives in version-controllable config files.
+all state (credentials, sync anchors, archived messages) lives in
+version-controllable files on disk.
 
 ## Non-goals
 
 - Admin / management operations (subscribe, mark-as-read, export). Out of v1.
 - A full-featured Zulip TUI. Targets are intentionally one-shot CLI calls.
 - Reimplementing what the official `zulip` Python client already provides.
+- Coupling to a session / chamber lifecycle (the way `cryo-zulip` is). Sync
+  here is generic per-(workspace, stream, topic).
+
+## Prior art
+
+`~/rcode/cryochamber` ships a Rust binary `cryo-zulip` that does
+incremental sync of one stream into a directory of per-message markdown
+files using a `zulip-sync.json` anchor. We adopt its **state-file +
+per-message markdown + PID-daemon** patterns; we do *not* adopt its
+single-stream-per-directory or chamber-session coupling, because this
+project is multi-workspace and multi-stream by design.
 
 ## Stack
 
@@ -29,19 +42,22 @@ all state lives in version-controllable config files.
 Makefile  ──>  uv run scripts/zlp.py <command> [args] --config <zuliprc>
                                 │
                                 ├──>  zulip.Client (official package) ──>  Zulip REST API
-                                └──>  scripts/format.py  (markdown / json renderers)
+                                ├──>  scripts/format.py     (markdown / json renderers, frontmatter)
+                                └──>  scripts/sync_daemon.py (background poller; spawned by `sync`)
 ```
 
-Three units, each with one responsibility:
+Four units, each with one responsibility:
 
-| Unit          | Responsibility                                  | Depends on                |
-|---------------|-------------------------------------------------|---------------------------|
-| `Makefile`    | Argument validation, workspace selection, UX    | `uv`, `scripts/zlp.py`    |
-| `scripts/zlp.py` | Dispatch subcommand → call Zulip client → render | `zulip` pkg, `format.py`  |
-| `scripts/format.py` | Pure rendering of API responses              | (no I/O, no network)      |
+| Unit                   | Responsibility                                              | Depends on                          |
+|------------------------|-------------------------------------------------------------|-------------------------------------|
+| `Makefile`             | Argument validation, workspace selection, UX                | `uv`, `scripts/zlp.py`              |
+| `scripts/zlp.py`       | Dispatch subcommand → call Zulip client → render or archive | `zulip` pkg, `format.py`            |
+| `scripts/format.py`    | Pure rendering, frontmatter read/write, archive path helpers| (no network)                        |
+| `scripts/sync_daemon.py` | Long-running background loop calling `zlp.py pull`        | `zlp.py` (subprocess), POSIX signals |
 
 The split keeps `format.py` trivially unit-testable from saved JSON
-fixtures, and lets `zlp.py` stay small.
+fixtures, lets `zlp.py` stay small, and isolates daemon-only concerns
+(forking, signals, PID files) from the per-call CLI path.
 
 ## File layout
 
@@ -50,18 +66,30 @@ zulip/
 ├── Makefile
 ├── pyproject.toml             # declares "zulip" as the only dep
 ├── .python-version            # pinned for uv
-├── .gitignore                 # configs/*.zuliprc, .venv, __pycache__
+├── .gitignore                 # configs/*.zuliprc, .venv, mail/, run/
 ├── README.md                  # quick-start + target reference
 ├── configs/
 │   └── quantum-info.zuliprc   # existing zuliprc, moved here
-└── scripts/
-    ├── zlp.py
-    └── format.py
+├── scripts/
+│   ├── zlp.py                 # dispatcher
+│   ├── sync_daemon.py         # background poller (one process per sync target)
+│   └── format.py              # rendering + frontmatter helpers
+├── mail/                      # local message archive (gitignored)
+│   └── <workspace>/<stream>/<topic>/
+│       ├── .sync-state.json   # anchor + stream metadata for this sync target
+│       └── <YYYY-MM-DDTHH-MM-SS>_<sender>_id<msgid>.md
+└── run/                       # daemon PID + log files (gitignored)
+    └── <workspace>__<stream>__<topic>.{pid,log}
 ```
 
 The pre-existing `/Users/liujinguo/zulip/zuliprc` is moved to
 `configs/quantum-info.zuliprc` during implementation; nothing else in the
 repo references the old path.
+
+When `TOPIC` is omitted from a sync target, the topic component of the
+path becomes `_all/`, which means "all topics in this stream". Each
+`(workspace, stream, topic)` triple is one sync target with its own
+state file and its own daemon process.
 
 ## Multi-workspace support
 
@@ -102,6 +130,15 @@ Conventions for Make variables: `STREAM`, `TOPIC`, `USER`, `MSG`, `FILE`,
 | `make edit` | `ID`, `MSG` | `WORKSPACE` | Edit your own message by id. |
 | `make delete` | `ID` | `WORKSPACE` | Delete your own message by id. |
 | `make upload` | `FILE`, `STREAM`, `TOPIC` | `MSG`, `WORKSPACE` | Upload a file and post a message containing the resulting link. |
+
+### Local archive + sync
+| Target | Required vars | Optional vars | Purpose |
+|--------|---------------|---------------|---------|
+| `make pull` | `STREAM` | `TOPIC`, `WORKSPACE`, `IMPORT_HISTORY=0` | One-shot incremental fetch into `mail/<ws>/<stream>/<topic\|_all>/`. Updates `.sync-state.json`. With `IMPORT_HISTORY=1` on first run, fetches all available history; otherwise starts from the newest message. |
+| `make sync` | `STREAM` | `TOPIC`, `WORKSPACE`, `INTERVAL=30` | Start a background daemon that runs `pull` every `INTERVAL` seconds. PID and log under `run/`. |
+| `make unsync` | `STREAM` | `TOPIC`, `WORKSPACE` | Stop the daemon for this sync target. |
+| `make sync-status` | — | `WORKSPACE` | List all sync targets, their last-pulled message id, and whether the daemon is alive. |
+| `make inbox` | `STREAM` | `TOPIC`, `LIMIT=20`, `WORKSPACE` | Render the most recent archived messages from disk (offline; works without network). |
 
 ### Argument guards
 
@@ -146,6 +183,77 @@ emitted unchanged so it can be piped to `jq`.
 - `streams`, `topics`, `workspaces` — one item per line, plain text.
 - `send`, `dm`, `edit`, `delete`, `upload` — print `ok id=<message_id>` on success.
 
+## Sync mechanics (ported from `cryo-zulip`)
+
+### State file (`mail/<ws>/<stream>/<topic|_all>/.sync-state.json`)
+
+```json
+{
+  "site": "https://quantum-info.zulipchat.com",
+  "workspace": "quantum-info",
+  "stream": "general",
+  "stream_id": 13,
+  "topic": "hello",            // null when topic == _all
+  "self_email": "jinguoliu@hkust-gz.edu.cn",
+  "last_message_id": 147640
+}
+```
+
+- `stream_id` and `self_email` are resolved on first `pull` and cached.
+- `last_message_id` is the anchor: the next pull uses
+  `narrow=[…]` + `anchor=last_message_id+1` + `num_before=0` +
+  `num_after=5000`, then walks forward in batches if `found_newest=false`.
+- On first run with `IMPORT_HISTORY=0` (default): set
+  `last_message_id` to the server's current newest message id and store
+  no archive (skip backfill). With `IMPORT_HISTORY=1`: set anchor to 0 and
+  fetch all available history.
+
+### Per-message file format
+
+Filename: `<UTC-iso-with-dashes>_<sender-id-or-slug>_id<msgid>.md`
+(e.g. `2026-04-26T10-30-00_alice_id147641.md`). The `id<msgid>` suffix
+makes deduplication trivial (re-pull is idempotent — skip if file exists).
+
+Body:
+
+```
+---
+from: Alice Chen
+from_email: alice@example.com
+stream: general
+topic: hello
+timestamp: 2026-04-26T10:30:00Z
+zulip_message_id: 147641
+source: zulip
+---
+
+hello world, here's a thought…
+```
+
+This frontmatter is a superset of `cryo-zulip`'s — anything that already
+parses cryo files will parse these too.
+
+### Daemon (`scripts/sync_daemon.py`)
+
+- Spawned via `make sync …`; detached via `os.fork()` (POSIX-only — fine
+  on macOS/Linux). Writes its PID to `run/<ws>__<stream>__<topic>.pid`.
+- Loop: `pull` once → sleep `INTERVAL` → repeat. Logs to
+  `run/<ws>__<stream>__<topic>.log`.
+- Liveness check (used by `make sync-status` and `make unsync`): read PID,
+  `os.kill(pid, 0)` — alive if no exception or `EPERM`.
+- `make unsync` sends SIGTERM and removes the pid file once the process
+  exits (5-second wait with poll, then SIGKILL fallback).
+- One sync target = one daemon. Re-running `make sync` for an already-running
+  target is a no-op with a friendly message.
+
+### `make sync-status` output
+
+```
+workspace        stream     topic    last_id   daemon  pulled_files
+quantum-info     general    hello    147641    alive   42
+quantum-info     general    _all     147641    stopped 1284
+```
+
 ## Error handling
 
 Just enough to make failures debuggable:
@@ -162,9 +270,11 @@ No retries, no fancy error classification — these are interactive one-shot com
 
 | Layer | What | How |
 |-------|------|-----|
-| `format.py` | Pure rendering | Unit tests with 2–3 saved JSON fixtures (one stream message, one DM, one with markdown content). Run via `make test`. |
+| `format.py` | Pure rendering + frontmatter helpers | Unit tests with 2–3 saved JSON fixtures (one stream message, one DM, one with markdown content). Round-trip test: render to file → parse back → equal frontmatter. Run via `make test`. |
 | `zlp.py` | Command dispatch + API integration | Smoke test target `make test-smoke` that exercises read-only ops (`streams`, `topics`, `messages`) against the real `quantum-info` workspace. Skipped if the config is missing. |
+| Sync state logic | Anchor advancement, dedup-by-id | Unit tests on pure functions in `sync_daemon.py` (`next_anchor`, `archive_path_for_message`, `is_already_archived`). |
 | Write ops | Send / edit / delete | Manual: `make test-smoke-write` sends a message to a designated test topic, then edits and deletes it. Not run by default. |
+| Daemon lifecycle | spawn / status / stop | `make test-smoke-daemon` against a throwaway topic: `sync` → `sync-status` (alive) → `unsync` → `sync-status` (stopped). |
 
 No mocking of the Zulip client — low value vs. the smoke test.
 
