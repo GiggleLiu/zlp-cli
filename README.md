@@ -1,7 +1,7 @@
-# zlp
+# zlp-cli
 
 [![PyPI](https://img.shields.io/pypi/v/zlp-cli.svg)](https://pypi.org/project/zlp-cli/)
-[![Build](https://img.shields.io/badge/build-pass-brightgreen)](https://github.com/GiggleLiu/zulip-management/actions/workflows/ci.yml)
+[![Build](https://img.shields.io/badge/build-pass-brightgreen)](https://github.com/GiggleLiu/zlp-cli/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Single-workspace Zulip CLI for humans and AI agents.** `zlp` is a small,
@@ -160,8 +160,8 @@ The CLI is designed to be the primitive layer below richer integrations:
 ## Development
 
 ```sh
-git clone https://github.com/GiggleLiu/zulip-management
-cd zulip-management
+git clone https://github.com/GiggleLiu/zlp-cli
+cd zlp-cli
 uv sync
 make test
 ```

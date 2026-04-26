@@ -39,9 +39,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/GiggleLiu/zulip-management"
-Issues = "https://github.com/GiggleLiu/zulip-management/issues"
-Source = "https://github.com/GiggleLiu/zulip-management"
+Homepage = "https://github.com/GiggleLiu/zlp-cli"
+Issues = "https://github.com/GiggleLiu/zlp-cli/issues"
+Source = "https://github.com/GiggleLiu/zlp-cli"
 
 [project.scripts]
 zlp = "zlp.cli:main"
