@@ -1,7 +1,17 @@
-configs/*.zuliprc
 .venv/
-mail/
-run/
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# build artifacts
+dist/
+build/
+*.egg-info/
+
+# local data (default CWD-relative roots)
+mail/
+run/
+zuliprc
+*.zuliprc

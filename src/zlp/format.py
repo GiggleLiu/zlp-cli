@@ -48,7 +48,6 @@ def atomic_write(path: Path | str, content: str) -> None:
 
 def render_markdown(
     messages: list[dict[str, Any]] | dict[str, Any],
-    workspace: str,
     stream: str | None = None,
     topic: str | None = None,
 ) -> str:
@@ -59,7 +58,6 @@ def render_markdown(
     header = f"## #{header_stream}"
     if header_topic:
         header += f" > {header_topic}"
-    header += f"   (workspace: {workspace})"
     parts = [header]
     for message in messages:
         timestamp = datetime.fromtimestamp(int(message.get("timestamp", 0)), timezone.utc)
@@ -79,7 +77,6 @@ def render_json(messages: Any) -> str:
 def archive_path_for_message(
     message: dict[str, Any],
     root: Path | str,
-    workspace: str,
     stream: str | None = None,
     topic: str | None = None,
 ) -> Path:
@@ -90,23 +87,21 @@ def archive_path_for_message(
     timestamp = datetime.fromtimestamp(int(message.get("timestamp", 0)), timezone.utc)
     sender = message.get("sender_full_name") or message.get("sender_email") or "unknown"
     filename = f"{timestamp:%Y-%m-%dT%H-%M-%S}_{slugify(sender)}_id{message['id']}.md"
-    return archive_root / slugify(workspace) / slugify(stream_name) / topic_slug / filename
+    return archive_root / slugify(stream_name) / topic_slug / filename
 
 
 def write_archive_file(
     message: dict[str, Any],
     root: Path | str,
-    workspace: str,
     stream: str | None = None,
     topic: str | None = None,
     archive: dict[str, Any] | None = None,
 ) -> Path:
-    path = archive_path_for_message(message, root, workspace, stream=stream, topic=topic)
+    path = archive_path_for_message(message, root, stream=stream, topic=topic)
     body = message.get("content", "")
     frontmatter = {key: value for key, value in message.items() if key != "content"}
     existing_archive = frontmatter.pop("_archive", {})
     archive_data = {
-        "workspace": workspace,
         "fetched_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "permalink": "",
         "attachments": [],
