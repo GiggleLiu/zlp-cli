@@ -123,7 +123,9 @@ def run_foreground(
 
     while not STOP:
         narrow = narrow_for(stream, topic)
-        registered = check(client.register(narrow=narrow, event_types=["message", "update_message", "delete_message"]))
+        registered = check(
+            client.register(narrow=narrow, event_types=["message", "update_message", "delete_message"])
+        )
         queue_id = registered["queue_id"]
         last_event_id = registered.get("last_event_id", -1)
         state = load_state(archive_root, stream, topic) or initial_state(client, stream, topic)
@@ -344,7 +346,9 @@ def event_message_ids(event: dict[str, Any]) -> list[int]:
 
 
 def find_archived_message(archive_root: Path, message_id: int) -> Path | None:
-    candidates = list(archive_root.rglob(f"*_id{message_id}.md")) + list(archive_root.rglob(f"*_id{message_id}.md.deleted"))
+    candidates = list(archive_root.rglob(f"*_id{message_id}.md")) + list(
+        archive_root.rglob(f"*_id{message_id}.md.deleted")
+    )
     return candidates[0] if candidates else None
 
 

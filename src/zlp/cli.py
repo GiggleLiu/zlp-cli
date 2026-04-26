@@ -143,8 +143,7 @@ def require_config(config: str) -> Path:
     if path.exists():
         return path
     print(
-        f"error: zuliprc not found at {path}. "
-        f"Set --config or $ZULIP_CONFIG_FILE.",
+        f"error: zuliprc not found at {path}. Set --config or $ZULIP_CONFIG_FILE.",
         file=sys.stderr,
     )
     raise SystemExit(1)
@@ -223,7 +222,9 @@ def cmd_search(client: zulip.Client, args: argparse.Namespace) -> int:
 
 def cmd_send(client: zulip.Client, args: argparse.Namespace) -> int:
     body = read_body(args)
-    resp = check(client.send_message({"type": "stream", "to": args.stream, "topic": args.topic, "content": body}))
+    resp = check(
+        client.send_message({"type": "stream", "to": args.stream, "topic": args.topic, "content": body})
+    )
     print(f"ok id={resp.get('id')}")
     return 0
 
@@ -256,7 +257,9 @@ def cmd_upload(client: zulip.Client, args: argparse.Namespace) -> int:
     content = f"[{path.name}]({uri})"
     if args.msg:
         content = f"{args.msg}\n\n{content}"
-    sent = check(client.send_message({"type": "stream", "to": args.stream, "topic": args.topic, "content": content}))
+    sent = check(
+        client.send_message({"type": "stream", "to": args.stream, "topic": args.topic, "content": content})
+    )
     print(f"ok id={sent.get('id')}")
     return 0
 

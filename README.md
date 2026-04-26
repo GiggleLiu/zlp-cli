@@ -1,7 +1,7 @@
 # zlp
 
 [![PyPI](https://img.shields.io/pypi/v/zlp.svg)](https://pypi.org/project/zlp/)
-[![Python](https://img.shields.io/pypi/pyversions/zlp.svg)](https://pypi.org/project/zlp/)
+[![Build](https://img.shields.io/badge/build-pass-brightgreen)](https://github.com/GiggleLiu/zulip-management/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Single-workspace Zulip CLI for humans and AI agents.** `zlp` is a small,
@@ -134,7 +134,18 @@ uv sync
 make test
 ```
 
-Source layout uses `src/zlp/`. Build wheels with `uv build` (or `python -m build`).
+Useful developer targets:
+
+```sh
+make fmt        # format Python with ruff
+make fmt-check  # check formatting
+make lint       # run ruff checks
+make check      # fmt-check + lint + tests
+make build      # build sdist and wheel artifacts
+```
+
+Source layout uses `src/zlp/`. Agent-facing workflow notes live in
+`AGENTS.md` and `.claude/CLAUDE.md`.
 
 ## License
 

@@ -59,16 +59,18 @@ class HelpAndUsageTests(unittest.TestCase):
 class ConfigResolutionTests(unittest.TestCase):
     def test_missing_config_file_exits_with_clear_message(self):
         with TemporaryDirectory() as dirname:
-            with patched_argv([
-                "zlp",
-                "--config",
-                str(Path(dirname) / "missing.zuliprc"),
-                "--archive-root",
-                dirname,
-                "--run-root",
-                dirname,
-                "whoami",
-            ]):
+            with patched_argv(
+                [
+                    "zlp",
+                    "--config",
+                    str(Path(dirname) / "missing.zuliprc"),
+                    "--archive-root",
+                    dirname,
+                    "--run-root",
+                    dirname,
+                    "whoami",
+                ]
+            ):
                 buf = io.StringIO()
                 with redirect_stderr(buf), self.assertRaises(SystemExit) as ctx:
                     cli.main()
@@ -92,14 +94,16 @@ class ConfigResolutionTests(unittest.TestCase):
 class ClientFreeCommandTests(unittest.TestCase):
     def test_sync_status_on_empty_archive_prints_header_only(self):
         with TemporaryDirectory() as dirname:
-            with patched_argv([
-                "zlp",
-                "--archive-root",
-                dirname,
-                "--run-root",
-                dirname,
-                "sync-status",
-            ]):
+            with patched_argv(
+                [
+                    "zlp",
+                    "--archive-root",
+                    dirname,
+                    "--run-root",
+                    dirname,
+                    "sync-status",
+                ]
+            ):
                 buf = io.StringIO()
                 with redirect_stdout(buf):
                     rc = cli.main()
@@ -108,16 +112,18 @@ class ClientFreeCommandTests(unittest.TestCase):
 
     def test_grep_returns_nonzero_when_archive_missing(self):
         with TemporaryDirectory() as dirname:
-            with patched_argv([
-                "zlp",
-                "--archive-root",
-                str(Path(dirname) / "missing"),
-                "--run-root",
-                dirname,
-                "grep",
-                "--query",
-                "anything",
-            ]):
+            with patched_argv(
+                [
+                    "zlp",
+                    "--archive-root",
+                    str(Path(dirname) / "missing"),
+                    "--run-root",
+                    dirname,
+                    "grep",
+                    "--query",
+                    "anything",
+                ]
+            ):
                 rc = cli.main()
                 self.assertEqual(rc, 1)
 

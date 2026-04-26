@@ -1,18 +1,24 @@
 PY = $(if $(wildcard .venv/bin/python),.venv/bin/python,uv run python)
 ZLP = $(if $(wildcard .venv/bin/zlp),.venv/bin/zlp,uv run zlp)
+RUFF = $(if $(wildcard .venv/bin/ruff),.venv/bin/ruff,uv run --extra dev ruff)
 STREAM ?= $(CHANNEL)
 
 require = $(if $($(1)),,$(error $(1) is required))
 require_msg = $(if $(or $(MSG),$(MSG_FILE)),,$(error MSG or MSG_FILE is required))
 
-.PHONY: install help whoami streams topics messages search send dm edit delete upload pull sync sync-fg unsync sync-status sync-log refresh inbox grep test
+.PHONY: install help fmt fmt-check lint build check clean whoami streams topics messages search send dm edit delete upload pull sync sync-fg unsync sync-status sync-log refresh inbox grep test
 
 install:
-	uv sync
+	uv sync --extra dev
 
 help:
 	@printf '%s\n' \
-	'install       uv sync - create .venv and install dependencies' \
+	'install       uv sync --extra dev - create .venv and install dependencies' \
+	'fmt           format Python code with ruff' \
+	'fmt-check     check Python formatting with ruff' \
+	'lint          run ruff lint checks' \
+	'build         build sdist and wheel artifacts' \
+	'check         run fmt-check, lint, and tests' \
 	'whoami        verify auth (uses ZULIP_CONFIG_FILE or ./zuliprc)' \
 	'help          list targets' \
 	'streams       list subscribed streams' \
@@ -34,6 +40,23 @@ help:
 	'inbox         render recent archived messages offline' \
 	'grep          search local archive offline' \
 	'test          run unit tests'
+
+fmt:
+	$(RUFF) format src tests
+
+fmt-check:
+	$(RUFF) format --check src tests
+
+lint:
+	$(RUFF) check src tests
+
+build:
+	uv build
+
+check: fmt-check lint test
+
+clean:
+	rm -rf build dist *.egg-info .ruff_cache .pytest_cache
 
 whoami:
 	$(ZLP) whoami
