@@ -83,9 +83,11 @@ zulip/
 │   ├── sync_daemon.py         # background poller (one process per sync target)
 │   └── format.py              # rendering + frontmatter helpers
 ├── mail/                      # local message archive (gitignored)
-│   └── <workspace>/<stream>/<topic>/
+│   └── <workspace>/<stream>/<topic|_all>/
 │       ├── .sync-state.json   # anchor + stream metadata for this sync target
-│       └── <YYYY-MM-DDTHH-MM-SS>_<sender>_id<msgid>.md
+│       ├── <YYYY-MM-DDTHH-MM-SS>_<sender>_id<msgid>.md      # human-readable
+│       ├── <YYYY-MM-DDTHH-MM-SS>_<sender>_id<msgid>.json    # full raw API object
+│       └── _files/<sha1>__<original-name>                   # downloaded attachments
 └── run/                       # daemon PID + log files (gitignored)
     └── <workspace>__<stream>__<topic>.{pid,log}
 ```
@@ -142,8 +144,8 @@ Conventions for Make variables: `STREAM`, `TOPIC`, `USER`, `MSG`, `FILE`,
 ### Local archive + sync
 | Target | Required vars | Optional vars | Purpose |
 |--------|---------------|---------------|---------|
-| `make pull` | `STREAM` | `TOPIC`, `WORKSPACE`, `IMPORT_HISTORY=0` | One-shot catchup via `get_messages` from `last_message_id` into `mail/<ws>/<stream>/<topic\|_all>/`. Updates `.sync-state.json`. With `IMPORT_HISTORY=1` on first run, fetches all available history; otherwise starts from the newest message. |
-| `make sync` | `STREAM` | `TOPIC`, `WORKSPACE` | Start a background daemon: catchup once via `pull`, then `client.call_on_each_event(...)` for the live tail. Real-time, no polling interval. PID and log under `run/`. |
+| `make pull` | `STREAM` | `TOPIC`, `WORKSPACE`, `IMPORT_HISTORY=0`, `ATTACHMENTS=1` | One-shot catchup via `get_messages` (with `apply_markdown=False`) from `last_message_id` into `mail/<ws>/<stream>/<topic\|_all>/`. Writes `.md` + `.json` per message; downloads attachments unless `ATTACHMENTS=0`. Updates `.sync-state.json`. With `IMPORT_HISTORY=1` on first run, fetches all available history; otherwise starts from the newest message. |
+| `make sync` | `STREAM` | `TOPIC`, `WORKSPACE`, `ATTACHMENTS=1` | Start a background daemon: catchup once via `pull`, then `client.call_on_each_event(...)` for the live tail. Real-time, no polling interval. PID and log under `run/`. |
 | `make unsync` | `STREAM` | `TOPIC`, `WORKSPACE` | Stop the daemon for this sync target. |
 | `make sync-status` | — | `WORKSPACE` | List all sync targets, their last-pulled message id, and whether the daemon is alive. |
 | `make inbox` | `STREAM` | `TOPIC`, `LIMIT=20`, `WORKSPACE` | Render the most recent archived messages from disk (offline; works without network). |
@@ -216,22 +218,44 @@ emitted unchanged so it can be piped to `jq`.
   no archive (skip backfill). With `IMPORT_HISTORY=1`: set anchor to 0 and
   fetch all available history.
 
-### Per-message file format
+### Per-message storage — side-by-side files for completeness
 
-Filename: `<UTC-iso-with-dashes>_<sender-id-or-slug>_id<msgid>.md`
-(e.g. `2026-04-26T10-30-00_alice_id147641.md`). The `id<msgid>` suffix
-makes deduplication trivial (re-pull is idempotent — skip if file exists).
+For each message, the daemon writes **two files** under
+`mail/<ws>/<stream>/<topic|_all>/`:
 
-Body:
+1. `<UTC>_<sender>_id<msgid>.md` — human-readable markdown for grep / browse.
+2. `<UTC>_<sender>_id<msgid>.json` — the full raw API message object,
+   exactly as returned by the server (reactions, edit_history, flags,
+   mentions, topic_links, sender metadata — every field).
+
+The `id<msgid>` suffix makes dedup trivial (re-pull is idempotent — skip
+if `.json` already exists). The `.md` file is *derived* from the `.json`
+and may be regenerated from it.
+
+**Why both:** the `.md` is what you read; the `.json` is what guarantees
+you can fully reconstruct or re-export the message later — including
+metadata that doesn't fit cleanly into frontmatter (e.g. reactions,
+multi-edit history).
+
+#### `.md` file — body and frontmatter
+
+API messages are fetched with `apply_markdown=False` so `content` is the
+original Zulip markdown source, not rendered HTML.
 
 ```
 ---
 from: Alice Chen
 from_email: alice@example.com
+sender_id: 9821
 stream: general
 topic: hello
 timestamp: 2026-04-26T10:30:00Z
 zulip_message_id: 147641
+type: stream
+edited: false                  # true if last_edit_timestamp present
+deleted: false                 # set true and renamed to .deleted on delete
+reactions: 0                   # count; details in .json
+attachments: []                # list of relative paths under _files/
 source: zulip
 ---
 
@@ -239,7 +263,25 @@ hello world, here's a thought…
 ```
 
 This frontmatter is a superset of `cryo-zulip`'s — anything that already
-parses cryo files will parse these too.
+parses cryo files will parse these too. The richer fields (`sender_id`,
+`reactions`, `attachments`, `edited`) are extras; the canonical truth
+remains in the sibling `.json`.
+
+On `update_message`: rewrite both `.md` and `.json` (the `.json`'s
+`edit_history` already accumulates the chain server-side). On
+`delete_message`: rename both files to `*.deleted`.
+
+#### Attachments
+
+When a message body contains `/user_uploads/...` URLs, the daemon
+downloads each one to
+`mail/<ws>/<stream>/<topic|_all>/_files/<sha1>__<original-filename>`
+and rewrites the URL in the `.md` body to the relative `_files/...`
+path. The `.json` keeps the original URL untouched. SHA-1 prefix
+deduplicates files referenced from multiple messages.
+
+Skip attachment download if `--no-attachments` is passed (or
+`ATTACHMENTS=0` from Make).
 
 ### Daemon (`scripts/sync_daemon.py`)
 
