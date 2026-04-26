@@ -29,6 +29,14 @@ per-message markdown + PID-daemon** patterns; we do *not* adopt its
 single-stream-per-directory or chamber-session coupling, because this
 project is multi-workspace and multi-stream by design.
 
+**One important upgrade over `cryo-zulip`'s polling loop:** the official
+`zulip` Python client provides `Client.call_on_each_event(callback,
+narrow=…, event_types=…)`, which uses Zulip's real-time **event queue**
+(long-polling). The server pushes events the moment they happen, with
+auto-reconnect and `BAD_EVENT_QUEUE_ID` recovery built in. We use this
+for the live tail, not periodic polling — sub-second latency, lower
+server load, and we transparently get edit/delete/reaction events too.
+
 ## Stack
 
 - **Make** — user-facing entry point.
@@ -53,7 +61,7 @@ Four units, each with one responsibility:
 | `Makefile`             | Argument validation, workspace selection, UX                | `uv`, `scripts/zlp.py`              |
 | `scripts/zlp.py`       | Dispatch subcommand → call Zulip client → render or archive | `zulip` pkg, `format.py`            |
 | `scripts/format.py`    | Pure rendering, frontmatter read/write, archive path helpers| (no network)                        |
-| `scripts/sync_daemon.py` | Long-running background loop calling `zlp.py pull`        | `zlp.py` (subprocess), POSIX signals |
+| `scripts/sync_daemon.py` | Long-running background process: catchup once, then `client.call_on_each_event` for live tail | `zulip` pkg event queue, `zlp.py` for catchup, POSIX signals |
 
 The split keeps `format.py` trivially unit-testable from saved JSON
 fixtures, lets `zlp.py` stay small, and isolates daemon-only concerns
@@ -134,8 +142,8 @@ Conventions for Make variables: `STREAM`, `TOPIC`, `USER`, `MSG`, `FILE`,
 ### Local archive + sync
 | Target | Required vars | Optional vars | Purpose |
 |--------|---------------|---------------|---------|
-| `make pull` | `STREAM` | `TOPIC`, `WORKSPACE`, `IMPORT_HISTORY=0` | One-shot incremental fetch into `mail/<ws>/<stream>/<topic\|_all>/`. Updates `.sync-state.json`. With `IMPORT_HISTORY=1` on first run, fetches all available history; otherwise starts from the newest message. |
-| `make sync` | `STREAM` | `TOPIC`, `WORKSPACE`, `INTERVAL=30` | Start a background daemon that runs `pull` every `INTERVAL` seconds. PID and log under `run/`. |
+| `make pull` | `STREAM` | `TOPIC`, `WORKSPACE`, `IMPORT_HISTORY=0` | One-shot catchup via `get_messages` from `last_message_id` into `mail/<ws>/<stream>/<topic\|_all>/`. Updates `.sync-state.json`. With `IMPORT_HISTORY=1` on first run, fetches all available history; otherwise starts from the newest message. |
+| `make sync` | `STREAM` | `TOPIC`, `WORKSPACE` | Start a background daemon: catchup once via `pull`, then `client.call_on_each_event(...)` for the live tail. Real-time, no polling interval. PID and log under `run/`. |
 | `make unsync` | `STREAM` | `TOPIC`, `WORKSPACE` | Stop the daemon for this sync target. |
 | `make sync-status` | — | `WORKSPACE` | List all sync targets, their last-pulled message id, and whether the daemon is alive. |
 | `make inbox` | `STREAM` | `TOPIC`, `LIMIT=20`, `WORKSPACE` | Render the most recent archived messages from disk (offline; works without network). |
@@ -237,14 +245,45 @@ parses cryo files will parse these too.
 
 - Spawned via `make sync …`; detached via `os.fork()` (POSIX-only — fine
   on macOS/Linux). Writes its PID to `run/<ws>__<stream>__<topic>.pid`.
-- Loop: `pull` once → sleep `INTERVAL` → repeat. Logs to
-  `run/<ws>__<stream>__<topic>.log`.
+- Lifecycle:
+  1. **Catchup:** call the same code path as `make pull` to drain any
+     messages added while the daemon was down (using `get_messages`
+     anchored at `last_message_id`). This closes the gap between
+     `last_message_id` and the server's current tail.
+  2. **Live tail:** call
+     `client.call_on_each_event(handle_event, narrow=narrow_for_target(),
+     event_types=["message", "update_message", "delete_message"])`.
+     This blocks. The SDK long-polls `/events`, auto-reconnects on
+     network blips, and re-registers the queue on `BAD_EVENT_QUEUE_ID`.
+- `handle_event(event)` per event type:
+  - `message` → `format.write_archive_file(...)`, then update
+    `last_message_id` in `.sync-state.json`.
+  - `update_message` → look up `id<msgid>.md` in the archive, rewrite
+    body and add an `edited_at` line to frontmatter (or skip if file is
+    not present locally — e.g. message predates archive).
+  - `delete_message` → rename `id<msgid>.md` to
+    `id<msgid>.md.deleted` (don't hard-delete; leaves a paper trail).
 - Liveness check (used by `make sync-status` and `make unsync`): read PID,
   `os.kill(pid, 0)` — alive if no exception or `EPERM`.
 - `make unsync` sends SIGTERM and removes the pid file once the process
-  exits (5-second wait with poll, then SIGKILL fallback).
+  exits (5-second wait with poll, then SIGKILL fallback). The SDK loop
+  is interruptible because long-poll requests have a `~10 min` timeout.
 - One sync target = one daemon. Re-running `make sync` for an already-running
   target is a no-op with a friendly message.
+
+### Why event queue, not polling
+
+`call_on_each_event` is Zulip's native real-time mechanism. Versus a
+polling loop:
+
+| Aspect           | Polling (`get_messages` every N s)        | `call_on_each_event` (event queue)     |
+|------------------|-------------------------------------------|----------------------------------------|
+| Latency          | up to N seconds                           | sub-second (server-pushed)             |
+| Server load      | repeated paginated `/messages` calls      | one long-poll connection per target    |
+| Edits & deletes  | not detected without extra polling logic  | first-class events                     |
+| Reconnect        | hand-rolled                               | built into the SDK                     |
+| Server restart   | hand-rolled queue-id recovery             | built-in `BAD_EVENT_QUEUE_ID` retry    |
+| Code we maintain | the loop, retry, and dedup                | just the per-event callback            |
 
 ### `make sync-status` output
 
