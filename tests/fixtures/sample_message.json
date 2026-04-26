@@ -1,0 +1,23 @@
+{
+  "avatar_url": "https://secure.gravatar.com/avatar/example",
+  "client": "website",
+  "content": "Hello **world**\n\nSee [upload](/user_uploads/1/2/report.pdf).",
+  "display_recipient": "General Discussion",
+  "edit_history": null,
+  "flags": [
+    "read"
+  ],
+  "id": 147641,
+  "is_me_message": false,
+  "last_edit_timestamp": null,
+  "mentions": [],
+  "recipient_id": 4012,
+  "reactions": [],
+  "sender_email": "alice@example.com",
+  "sender_full_name": "Alice Chen",
+  "sender_id": 9821,
+  "subject": "Launch/Notes",
+  "timestamp": 1777170600,
+  "topic_links": [],
+  "type": "stream"
+}
