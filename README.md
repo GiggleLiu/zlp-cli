@@ -1,6 +1,6 @@
 # zlp
 
-[![PyPI](https://img.shields.io/pypi/v/zlp.svg)](https://pypi.org/project/zlp/)
+[![PyPI](https://img.shields.io/pypi/v/zlp-cli.svg)](https://pypi.org/project/zlp-cli/)
 [![Build](https://img.shields.io/badge/build-pass-brightgreen)](https://github.com/GiggleLiu/zulip-management/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -11,8 +11,8 @@ archive that's easy to `grep` and easy for an LLM to read.
 
 It deliberately knows nothing about *which* Zulip workspace it's talking to —
 one process, one `zuliprc`, one archive directory. Driving multiple workspaces
-is the job of an outer layer (e.g. a sibling `zulip-workspaces/` repo that
-keeps per-workspace credentials and `cd`s into each before invoking `zlp`).
+is the job of an outer layer that keeps per-workspace credentials and `cd`s into
+each before invoking `zlp`.
 
 ## Why
 
@@ -31,7 +31,7 @@ keeps per-workspace credentials and `cd`s into each before invoking `zlp`).
 ## Install
 
 ```sh
-pip install zlp        # or: uv pip install zlp
+pip install zlp-cli        # or: uv pip install zlp-cli
 ```
 
 This installs the `zlp` console script. You'll also need a `zuliprc` file —
@@ -149,9 +149,9 @@ that daemon's output.
 
 The CLI is designed to be the primitive layer below richer integrations:
 
-- **Outer workspace manager.** Keep `zuliprc` files, mail dirs, and run dirs in
-  a separate repo (e.g. `zulip-workspaces/<account>/`) and dispatch `zlp` per
-  account by setting `ZULIP_CONFIG_FILE`, `ZLP_ARCHIVE_ROOT`, `ZLP_RUN_ROOT`.
+- **Outer workspace manager.** Keep `zuliprc` files, mail dirs, and run dirs
+  outside this package and dispatch `zlp` per account by setting
+  `ZULIP_CONFIG_FILE`, `ZLP_ARCHIVE_ROOT`, `ZLP_RUN_ROOT`.
 - **MCP / function-calling shells.** Subcommands map cleanly onto tool
   schemas; outputs are stable enough to feed back into a model.
 - **CI / cron jobs.** `pull` for snapshots and one-shot incremental catchup,
@@ -161,7 +161,7 @@ The CLI is designed to be the primitive layer below richer integrations:
 
 ```sh
 git clone https://github.com/GiggleLiu/zulip-management
-cd zlp
+cd zulip-management
 uv sync
 make test
 ```

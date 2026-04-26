@@ -3,7 +3,7 @@ requires = ["hatchling>=1.21"]
 build-backend = "hatchling.build"
 
 [project]
-name = "zlp"
+name = "zlp-cli"
 version = "0.1.0"
 description = "Single-workspace Zulip CLI toolkit for humans and AI agents — read, write, archive, and grep one Zulip workspace from the shell."
 readme = "README.md"

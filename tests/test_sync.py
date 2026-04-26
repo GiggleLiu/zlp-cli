@@ -5,7 +5,10 @@ from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from requests.exceptions import ChunkedEncodingError, HTTPError
+
 from zlp.sync import (
+    archive_message,
     catchup,
     catchup_workspace,
     find_archived_message,
@@ -165,6 +168,70 @@ class WorkspaceCatchupTests(unittest.TestCase):
 
 
 class ArchiveOutputTests(unittest.TestCase):
+    def test_missing_attachment_does_not_abort_archive(self):
+        class FakeResponse:
+            content = b""
+
+            def raise_for_status(self):
+                raise HTTPError("404 Client Error")
+
+        class FakeSession:
+            def get(self, url, timeout):
+                return FakeResponse()
+
+        class FakeClient:
+            base_url = "https://example.zulipchat.com/api/"
+            session = FakeSession()
+
+            def ensure_session(self):
+                pass
+
+        message = {
+            "id": 12,
+            "timestamp": 1710000000,
+            "sender_full_name": "Ada",
+            "display_recipient": "general",
+            "subject": "launch",
+            "type": "stream",
+            "content": "see [missing](/user_uploads/1/2/missing.pdf)",
+            "stream_id": 1,
+        }
+
+        with TemporaryDirectory() as dirname:
+            path = archive_message(FakeClient(), message, Path(dirname), None, None, attachments=True)
+
+            self.assertTrue(path.exists())
+            self.assertIn("/user_uploads/1/2/missing.pdf", path.read_text())
+
+    def test_interrupted_attachment_download_does_not_abort_archive(self):
+        class FakeSession:
+            def get(self, url, timeout):
+                raise ChunkedEncodingError("incomplete read")
+
+        class FakeClient:
+            base_url = "https://example.zulipchat.com/api/"
+            session = FakeSession()
+
+            def ensure_session(self):
+                pass
+
+        message = {
+            "id": 13,
+            "timestamp": 1710000000,
+            "sender_full_name": "Ada",
+            "display_recipient": "general",
+            "subject": "launch",
+            "type": "stream",
+            "content": "see [broken](/user_uploads/1/2/broken.pdf)",
+            "stream_id": 1,
+        }
+
+        with TemporaryDirectory() as dirname:
+            path = archive_message(FakeClient(), message, Path(dirname), None, None, attachments=True)
+
+            self.assertTrue(path.exists())
+            self.assertIn("/user_uploads/1/2/broken.pdf", path.read_text())
+
     def test_stream_catchup_prints_archived_paths_by_default(self):
         class FakeClient:
             base_url = "https://example.zulipchat.com/api/"

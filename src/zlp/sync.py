@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+from requests.exceptions import RequestException
 import zulip
 
 from .format import atomic_write, slugify, write_archive_file
@@ -407,8 +408,12 @@ def download_attachments(client: zulip.Client, message: dict[str, Any], director
     downloaded = []
     for url in urls:
         full_url = urljoin(site, url)
-        response = client.session.get(full_url, timeout=30)
-        response.raise_for_status()
+        try:
+            response = client.session.get(full_url, timeout=30)
+            response.raise_for_status()
+        except RequestException as exc:
+            print(f"warning: failed to download attachment {url}: {exc}", file=sys.stderr)
+            continue
         original = sanitize_filename(Path(urlparse(url).path).name or "attachment")
         digest = hashlib.sha256(response.content).hexdigest()[:12]
         target = files_dir / f"{digest}__{original}"
